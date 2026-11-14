@@ -1,7 +1,6 @@
-/* eslint-disable import/no-extraneous-dependencies */
-import { execSync } from 'child_process'
-import path from 'path'
-import rimraf from 'rimraf'
+import { execSync } from 'node:child_process'
+import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 
 function isInGitRepository(): boolean {
   try {
@@ -19,6 +18,14 @@ function isInMercurialRepository(): boolean {
   return false
 }
 
+function isDefaultBranchSet(): boolean {
+  try {
+    execSync('git config init.defaultBranch', { stdio: 'ignore' })
+    return true
+  } catch (_) {}
+  return false
+}
+
 export function tryGitInit(root: string): boolean {
   let didInit = false
   try {
@@ -30,7 +37,9 @@ export function tryGitInit(root: string): boolean {
     execSync('git init', { stdio: 'ignore' })
     didInit = true
 
-    execSync('git checkout -b main', { stdio: 'ignore' })
+    if (!isDefaultBranchSet()) {
+      execSync('git checkout -b main', { stdio: 'ignore' })
+    }
 
     execSync('git add -A', { stdio: 'ignore' })
     execSync('git commit -m "Initial commit from Create Next App"', {
@@ -40,7 +49,7 @@ export function tryGitInit(root: string): boolean {
   } catch (e) {
     if (didInit) {
       try {
-        rimraf.sync(path.join(root, '.git'))
+        rmSync(join(root, '.git'), { recursive: true, force: true })
       } catch (_) {}
     }
     return false

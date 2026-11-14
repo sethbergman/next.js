@@ -1,0 +1,11 @@
+services:
+  with-docker-multi-env-staging:
+    build:
+      context: ../../
+      dockerfile: docker/staging/Dockerfile
+    image: with-docker-multi-env-staging
+    ports:
+      - "3002:3000"
+    environment:
+      # Read from your shell, for example `API_SECRET=... make start-staging`.
+      API_SECRET: ${API_SECRET:-}

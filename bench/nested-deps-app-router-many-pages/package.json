@@ -1,0 +1,19 @@
+{
+  "name": "nested-deps-app-router-many-pages",
+  "scripts": {
+    "prepare-bench": "rimraf components app && fuzzponent -d 2 -s 206 -o components && node ./create-pages.mjs",
+    "dev-application": "next dev",
+    "build-application": "next build",
+    "start": "next start",
+    "dev-nocache": "rimraf .next && pnpm dev-application",
+    "dev-cpuprofile-nocache": "rimraf .next && node --cpu-prof ../../node_modules/next/dist/bin/next",
+    "build-nocache": "rimraf .next && pnpm build-application",
+    "bench-warm-build": "node ./bench-warm-build.mjs"
+  },
+  "devDependencies": {
+    "fuzzponent": "workspace:*",
+    "pretty-ms": "^7.0.1",
+    "rimraf": "^3.0.2",
+    "next": "workspace:*"
+  }
+}

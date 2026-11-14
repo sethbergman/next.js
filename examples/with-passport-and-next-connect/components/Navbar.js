@@ -1,12 +1,12 @@
-import Link from 'next/link'
-import { useUser } from '../lib/hooks'
+import Link from "next/link";
+import { useUser } from "../lib/hooks";
 
 export default function Navbar() {
-  const [user, { mutate }] = useUser()
+  const [user, { mutate }] = useUser();
 
   async function handleLogout() {
-    await fetch('/api/logout')
-    mutate({ user: null })
+    await fetch("/api/logout");
+    mutate({ user: null });
   }
 
   return (
@@ -14,16 +14,12 @@ export default function Navbar() {
       <nav>
         <ul>
           <li>
-            <Link href="/">
-              <a>Home</a>
-            </Link>
+            <Link href="/">Home</Link>
           </li>
           {user ? (
             <>
               <li>
-                <Link href="/profile">
-                  <a>Profile</a>
-                </Link>
+                <Link href="/profile">Profile</Link>
               </li>
               <li>
                 <a role="button" onClick={handleLogout}>
@@ -34,14 +30,10 @@ export default function Navbar() {
           ) : (
             <>
               <li>
-                <Link href="/signup">
-                  <a>Sign up</a>
-                </Link>
+                <Link href="/signup">Sign up</Link>
               </li>
               <li>
-                <Link href="/login">
-                  <a>Login</a>
-                </Link>
+                <Link href="/login">Login</Link>
               </li>
             </>
           )}
@@ -72,9 +64,9 @@ export default function Navbar() {
         }
         header {
           color: #fff;
-          background-color: #333;
+          background-color: #666;
         }
       `}</style>
     </header>
-  )
+  );
 }

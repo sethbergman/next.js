@@ -1,0 +1,5 @@
+1 -> 2 free var = FreeVar(A)
+
+3 -> 4 free var = FreeVar(A)
+
+5 -> 6 free var = FreeVar(B)

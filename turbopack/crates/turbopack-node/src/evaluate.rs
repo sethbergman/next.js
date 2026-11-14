@@ -1,0 +1,965 @@
+use std::{iter, process::ExitStatus, time::Duration};
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use bincode::{Decode, Encode};
+use bytes::Bytes;
+use futures_retry::{FutureRetry, RetryPolicy};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value as JsonValue;
+use turbo_rcstr::{RcStr, rcstr};
+use turbo_tasks::{
+    Completion, FxIndexMap, OperationVc, PrettyPrintError, ReadRef, ResolvedVc, TryJoinIterExt, Vc,
+    duration_span, parallel::available_parallelism,
+    resolve_strongly_consistent_and_take_and_apply_effects,
+};
+use turbo_tasks_env::{EnvMap, ProcessEnv};
+use turbo_tasks_fs::{File, FileContent, FileSystemPath, to_sys_path};
+use turbopack_core::{
+    asset::AssetContent,
+    changed::content_changed,
+    chunk::{ChunkingContext, ChunkingContextExt, EvaluatableAsset, EvaluatableAssets},
+    context::AssetContext,
+    file_source::FileSource,
+    ident::AssetIdent,
+    issue::{Issue, IssueExt, IssueSeverity, IssueSource, IssueStage, StyledString},
+    module::Module,
+    module_graph::{
+        GraphEntries, ModuleGraph,
+        chunk_group_info::{ChunkGroupEntry, ChunkGroupKey, EntryHeuristics},
+    },
+    output::{OutputAsset, OutputAssets},
+    reference_type::{InnerAssets, ReferenceType},
+    source::Source,
+    virtual_source::VirtualSource,
+};
+
+use crate::{
+    AssetsForSourceMapping,
+    backend::{CreatePoolOptions, NodeBackend},
+    embed_js::embed_file_path,
+    emit, emit_package_json,
+    format::FormattingMode,
+    internal_assets_for_source_mapping,
+    source_map::StructuredError,
+};
+
+/// An argument passed to the evaluated JavaScript.
+#[turbo_tasks::task_input]
+#[derive(Clone, Hash, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum EvaluateArg {
+    Vc(ResolvedVc<JsonValue>),
+    /// Passed as a string: A path relative to the evaluation working directory when both are on the
+    /// same filesystem, otherwise an absolute system path (e.g. for an additional root).
+    ///
+    /// This is converted when the evaluation runs, so that machine-specific system paths aren't
+    /// stored in task inputs or cells.
+    Path(FileSystemPath),
+}
+
+impl EvaluateArg {
+    async fn to_json(&self, cwd: &FileSystemPath) -> Result<EvaluatedArg> {
+        Ok(match self {
+            Self::Vc(value) => EvaluatedArg::ReadRef(value.await?),
+            Self::Path(path) => {
+                let path = if let Some(relative) = cwd.get_relative_path_to(path) {
+                    // prefer to give the loader a relative path if we can, to reduce the risk of
+                    // the webpack loader storing a absolute path in the output.
+                    //
+                    // this uses a unix-style `/`-separated path, but Node.js file APIs support both
+                    // `/` and `\` on Windows.
+                    relative.into_owned()
+                } else {
+                    // if the path is on another root, we must give the loader an absolute path
+                    to_sys_path(path.clone())
+                        .await?
+                        .with_context(|| format!("{path} is not on a disk filesystem"))?
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|path| anyhow!("{path:?} is not valid UTF-8"))?
+                };
+                EvaluatedArg::Owned(JsonValue::String(path))
+            }
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum EvaluatedArg {
+    ReadRef(ReadRef<JsonValue>),
+    Owned(JsonValue),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum EvalJavaScriptOutgoingMessage<'a> {
+    #[serde(rename_all = "camelCase")]
+    Evaluate { args: &'a [EvaluatedArg] },
+    Result {
+        id: u64,
+        data: Option<JsonValue>,
+        error: Option<String>,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum EvalJavaScriptIncomingMessage {
+    Info { data: JsonValue },
+    Request { id: u64, data: JsonValue },
+    End { data: Option<String> },
+    Error(StructuredError),
+}
+
+#[cfg(all(test, feature = "process_pool", not(target_family = "wasm")))]
+use crate::pool_stats::PoolStatsSnapshot;
+
+#[turbo_tasks::value(
+    cell = "new",
+    serialization = "skip",
+    evict = "last",
+    eq = "manual",
+    shared
+)]
+pub struct EvaluatePool {
+    #[turbo_tasks(unsafe_ignore, debug_ignore)]
+    pool: Box<dyn EvaluateOperation>,
+    pub(crate) assets_for_source_mapping: ResolvedVc<AssetsForSourceMapping>,
+    pub(crate) assets_root: FileSystemPath,
+    project_dir: FileSystemPath,
+}
+
+impl EvaluatePool {
+    #[cfg(any(feature = "process_pool", feature = "worker_pool"))]
+    pub(crate) fn new(
+        pool: Box<dyn EvaluateOperation>,
+        assets_for_source_mapping: ResolvedVc<AssetsForSourceMapping>,
+        assets_root: FileSystemPath,
+        project_dir: FileSystemPath,
+    ) -> Self {
+        Self {
+            pool,
+            assets_for_source_mapping,
+            assets_root,
+            project_dir,
+        }
+    }
+
+    pub(crate) async fn operation(&self) -> Result<Box<dyn Operation>> {
+        self.pool.operation().await
+    }
+
+    #[cfg(all(test, feature = "process_pool", not(target_family = "wasm")))]
+    pub(crate) fn stats(&self) -> PoolStatsSnapshot {
+        self.pool.stats()
+    }
+
+    pub(crate) fn pre_warm(&self) {
+        self.pool.pre_warm()
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait EvaluateOperation: Send + Sync {
+    async fn operation(&self) -> Result<Box<dyn Operation>>;
+    #[cfg(all(test, feature = "process_pool", not(target_family = "wasm")))]
+    fn stats(&self) -> PoolStatsSnapshot;
+    /// Eagerly spawn a Node.js worker so it's ready when the first [`Self::operation`] is called.
+    /// The worker should go into the idle queue.
+    ///
+    /// If a worker request comes in while this is still initializing, it should wait on the bootup
+    /// semaphore and will resume when the worker is ready.
+    fn pre_warm(&self);
+}
+
+#[async_trait::async_trait]
+pub(crate) trait Operation: Send {
+    async fn recv(&mut self) -> Result<Bytes>;
+
+    async fn send(&mut self, data: Bytes) -> Result<()>;
+
+    async fn wait_or_kill(&mut self) -> Result<ExitStatus>;
+
+    fn disallow_reuse(&mut self) -> ();
+}
+
+#[turbo_tasks::value]
+struct EmittedEvaluatePoolAssets {
+    bootstrap: ResolvedVc<Box<dyn OutputAsset>>,
+    output_root: FileSystemPath,
+    entrypoint: FileSystemPath,
+}
+
+#[turbo_tasks::function(operation, root)]
+async fn emit_evaluate_pool_assets_operation(
+    entries: ResolvedVc<EvaluateEntries>,
+    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
+) -> Result<Vc<EmittedEvaluatePoolAssets>> {
+    let EvaluateEntries {
+        entries,
+        main_entry_ident,
+    } = &*entries.await?;
+
+    let entrypoint = chunking_context
+        .chunk_path(
+            None,
+            **main_entry_ident,
+            Some(rcstr!("pool_entry")),
+            rcstr!(".js"),
+        )
+        .owned()
+        .await?;
+
+    let bootstrap = chunking_context.root_entry_chunk_group_asset(
+        entrypoint.clone(),
+        ChunkGroupKey::Entry(entries.iter().cloned().map(ResolvedVc::upcast).collect()),
+        *module_graph,
+        OutputAssets::empty(),
+        OutputAssets::empty(),
+    );
+
+    let output_root = chunking_context.output_root().owned().await?;
+    emit_package_json(output_root.clone())?
+        .as_side_effect()
+        .await?;
+    emit(bootstrap, output_root.clone())
+        .as_side_effect()
+        .await?;
+
+    Ok(EmittedEvaluatePoolAssets {
+        bootstrap: bootstrap.to_resolved().await?,
+        output_root,
+        entrypoint,
+    }
+    .cell())
+}
+
+#[turbo_tasks::function(operation, root, session_dependent)]
+async fn create_evaluate_pool_assets_operation(
+    entries: ResolvedVc<EvaluateEntries>,
+    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
+) -> Result<Vc<EmittedEvaluatePoolAssets>> {
+    let operation = emit_evaluate_pool_assets_operation(entries, chunking_context, module_graph);
+    // Apply the effects here (inside this producing task) via the bounded-retry helper, draining
+    // them from the nested emit operation. Returning the serializable `EmittedEvaluatePoolAssets`
+    // (rather than a `serialization = "skip"` wrapper carrying the effects) keeps this task's
+    // output restorable from the persistent cache, so a warm restart does not re-run the
+    // effect-producing tasks.
+    //
+    // HACK: applying effects from inside a task means they may get re-applied if this task is
+    // invalidated. That's acceptable because the pool is created lazily; we can't move the
+    // apply to a true top-level task without eagerly reading the operation.
+    let assets = resolve_strongly_consistent_and_take_and_apply_effects(operation).await?;
+
+    Ok(*assets)
+}
+
+#[turbo_tasks::task_input]
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, Encode, Decode)]
+pub(crate) enum EnvVarTracking {
+    WholeEnvTracked,
+    Untracked,
+}
+
+#[turbo_tasks::function(operation, root)]
+/// Pass the file you cared as `runtime_entries` to invalidate and reload the
+/// evaluated result automatically.
+pub(crate) async fn get_evaluate_pool(
+    entries: ResolvedVc<EvaluateEntries>,
+    cwd: FileSystemPath,
+    env: ResolvedVc<Box<dyn ProcessEnv>>,
+    node_backend: ResolvedVc<Box<dyn NodeBackend>>,
+    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
+    additional_invalidation: ResolvedVc<Completion>,
+    debug: bool,
+    env_var_tracking: EnvVarTracking,
+) -> Result<Vc<EvaluatePool>> {
+    let assets_op = create_evaluate_pool_assets_operation(entries, chunking_context, module_graph);
+    // Effects are applied inside `create_evaluate_pool_assets_operation`; a plain strongly
+    // consistent read suffices here.
+    let assets = assets_op.read_strongly_consistent().await?;
+
+    let EmittedEvaluatePoolAssets {
+        bootstrap,
+        output_root,
+        entrypoint,
+    } = &*assets;
+
+    let (Some(cwd), Some(entrypoint)) = (
+        to_sys_path(cwd.clone()).await?,
+        to_sys_path(entrypoint.clone()).await?,
+    ) else {
+        panic!("can only evaluate from a disk filesystem");
+    };
+
+    // Invalidate pool when code content changes
+    content_changed(Vc::upcast(**bootstrap)).await?;
+    let assets_for_source_mapping = internal_assets_for_source_mapping(
+        **bootstrap,
+        output_root.clone(),
+        *chunking_context.emitted_source_map_type().await?,
+    )
+    .to_resolved()
+    .await?;
+    let env = match env_var_tracking {
+        EnvVarTracking::WholeEnvTracked => env.read_all().await?,
+        EnvVarTracking::Untracked => {
+            // We always depend on some known env vars that are used by Node.js
+            common_node_env(*env).await?;
+            for name in ["FORCE_COLOR", "NO_COLOR", "OPENSSL_CONF", "TZ"] {
+                env.read(name.into()).await?;
+            }
+
+            env.read_all().untracked().await?
+        }
+    };
+
+    let node_backend = node_backend.into_trait_ref().await?;
+    let pool = node_backend
+        .create_pool(CreatePoolOptions {
+            cwd,
+            entrypoint,
+            env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            assets_for_source_mapping,
+            assets_root: output_root.clone(),
+            project_dir: chunking_context.root_path().owned().await?,
+            concurrency: available_parallelism().map_or(1, |v| v.get()),
+            debug,
+        })
+        .await?;
+    pool.pre_warm();
+    additional_invalidation.await?;
+    Ok(pool.cell())
+}
+
+#[turbo_tasks::function]
+async fn common_node_env(env: Vc<Box<dyn ProcessEnv>>) -> Result<Vc<EnvMap>> {
+    let mut filtered = FxIndexMap::default();
+    let env = env.read_all().await?;
+    for (key, value) in &*env {
+        let uppercase = key.to_uppercase();
+        for filter in &["NODE_", "UV_", "SSL_"] {
+            if uppercase.starts_with(filter) {
+                filtered.insert(key.clone(), value.clone());
+                break;
+            }
+        }
+    }
+    Ok(Vc::cell(filtered.into()))
+}
+
+/// A Node.js process could not connect back to us over the loopback interface.
+///
+/// Backends return this when acquiring a worker operation so that it can be
+/// reported as an actionable issue. This is not a bug in the evaluated code and
+/// retrying will not help, it usually means a sandbox blocks local networking.
+#[derive(Debug)]
+pub(crate) struct NodeJsConnectError {
+    /// The error output of the child process, which contains the reason the
+    /// connection failed.
+    pub(crate) stderr: String,
+}
+
+impl std::fmt::Display for NodeJsConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The Node.js child process could not connect to the parent process\n{}",
+            self.stderr
+        )
+    }
+}
+
+impl std::error::Error for NodeJsConnectError {}
+
+impl NodeJsConnectError {
+    /// Finds a [`NodeJsConnectError`] anywhere in the cause chain of `err`.
+    fn find(err: &anyhow::Error) -> Option<&Self> {
+        err.chain().find_map(|cause| cause.downcast_ref::<Self>())
+    }
+}
+
+struct PoolErrorHandler;
+
+/// Number of attempts before we start slowing down the retry.
+const MAX_FAST_ATTEMPTS: usize = 5;
+/// Total number of attempts.
+const MAX_ATTEMPTS: usize = MAX_FAST_ATTEMPTS * 2;
+
+impl futures_retry::ErrorHandler<anyhow::Error> for PoolErrorHandler {
+    type OutError = anyhow::Error;
+
+    fn handle(&mut self, attempt: usize, err: anyhow::Error) -> RetryPolicy<Self::OutError> {
+        // A process that cannot connect to us will not be able to on a retry either.
+        if attempt >= MAX_ATTEMPTS || NodeJsConnectError::find(&err).is_some() {
+            RetryPolicy::ForwardError(err)
+        } else if attempt >= MAX_FAST_ATTEMPTS {
+            RetryPolicy::WaitRetry(Duration::from_secs(1))
+        } else {
+            RetryPolicy::Repeat
+        }
+    }
+}
+
+pub(crate) trait EvaluateContext {
+    type InfoMessage: DeserializeOwned;
+    type RequestMessage: DeserializeOwned;
+    type ResponseMessage: Serialize;
+    type State: Default;
+
+    fn pool(&self) -> OperationVc<EvaluatePool>;
+    fn keep_alive(&self) -> bool {
+        false
+    }
+    fn args(&self) -> &[EvaluateArg];
+    fn cwd(&self) -> Vc<FileSystemPath>;
+    /// The source that issues about this evaluation are attributed to.
+    fn context_source_for_issue(&self) -> ResolvedVc<Box<dyn Source>>;
+    fn emit_error(
+        &self,
+        error: StructuredError,
+        pool: &EvaluatePool,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn info(
+        &self,
+        state: &mut Self::State,
+        data: Self::InfoMessage,
+        pool: &EvaluatePool,
+    ) -> impl Future<Output = Result<()>> + Send;
+    fn request(
+        &self,
+        state: &mut Self::State,
+        data: Self::RequestMessage,
+        pool: &EvaluatePool,
+    ) -> impl Future<Output = Result<Self::ResponseMessage>> + Send;
+    fn finish(
+        &self,
+        state: Self::State,
+        pool: &EvaluatePool,
+    ) -> impl Future<Output = Result<()>> + Send;
+
+    /// Optional human-readable prefix describing *what was being evaluated*,
+    /// included verbatim in the message of the synthetic [`StructuredError`]
+    /// emitted when the Node.js subprocess crashes mid-evaluation. For
+    /// webpack-loader evaluations this is the loader chain ("loaders
+    /// [foo, bar]"). The default returns `None`.
+    fn crash_context_prefix(&self) -> Option<RcStr> {
+        None
+    }
+}
+
+pub(crate) async fn custom_evaluate(
+    evaluate_context: impl EvaluateContext,
+) -> Result<Vc<Option<RcStr>>> {
+    let pool_op = evaluate_context.pool();
+    let mut state = Default::default();
+
+    // Read this strongly consistent, since we don't want to run inconsistent
+    // node.js code.
+    let pool = pool_op.read_strongly_consistent().await?;
+
+    let cwd = evaluate_context.cwd().owned().await?;
+    let args = evaluate_context
+        .args()
+        .iter()
+        .map(|arg| arg.to_json(&cwd))
+        .try_join()
+        .await?;
+    // Assume this is a one-off operation, so we can kill the process
+    // TODO use a better way to decide that.
+    let kill = !evaluate_context.keep_alive();
+
+    // Workers in the pool could be in a bad state that we didn't detect yet.
+    // The bad state might even be unnoticeable until we actually send the job to the
+    // worker. So we retry picking workers from the pools until we succeed
+    // sending the job.
+
+    let operation = FutureRetry::new(
+        async || {
+            let mut operation = pool.operation().await?;
+            operation
+                .send(Bytes::from(serde_json::to_vec(
+                    &EvalJavaScriptOutgoingMessage::Evaluate { args: &args },
+                )?))
+                .await?;
+            Ok(operation)
+        },
+        PoolErrorHandler,
+    )
+    .await;
+    let mut operation = match operation {
+        Ok((operation, _)) => operation,
+        Err((err, _)) => {
+            if let Some(connect_error) = NodeJsConnectError::find(&err) {
+                NodeJsConnectIssue {
+                    source: IssueSource::from_source_only(
+                        evaluate_context.context_source_for_issue(),
+                    ),
+                    crash_context: evaluate_context.crash_context_prefix(),
+                    // Connection errors happen first thing on startup, so we shouldn't be too
+                    // worried about this being overly long.
+                    stderr: connect_error.stderr.as_str().trim().into(),
+                }
+                .resolved_cell()
+                .emit();
+                return Ok(Vc::cell(None));
+            }
+            return Err(err);
+        }
+    };
+
+    // The evaluation sent an initial intermediate value without completing. We'll
+    // need to spawn a new thread to continually pull data out of the process,
+    // and ferry that along.
+    let result = pull_operation(&mut operation, &pool, &evaluate_context, &mut state).await?;
+
+    evaluate_context.finish(state, &pool).await?;
+
+    if kill {
+        operation.wait_or_kill().await?;
+    }
+
+    Ok(Vc::cell(result.map(RcStr::from)))
+}
+
+#[turbo_tasks::value]
+pub struct EvaluateEntries {
+    entries: Vec<ResolvedVc<Box<dyn EvaluatableAsset + 'static>>>,
+    main_entry_ident: ResolvedVc<AssetIdent>,
+}
+
+#[turbo_tasks::value_impl]
+impl EvaluateEntries {
+    #[turbo_tasks::function]
+    pub async fn graph_entries(self: Vc<Self>) -> Result<Vc<GraphEntries>> {
+        Ok(
+            GraphEntries::from_chunk_groups(vec![ChunkGroupEntry::Entry {
+                modules: self
+                    .await?
+                    .entries
+                    .iter()
+                    .cloned()
+                    .map(ResolvedVc::upcast)
+                    .collect(),
+                heuristics: EntryHeuristics::default(),
+            }])
+            .cell(),
+        )
+    }
+}
+
+#[turbo_tasks::function]
+pub async fn get_evaluate_entries(
+    module_asset: ResolvedVc<Box<dyn Module>>,
+    asset_context: ResolvedVc<Box<dyn AssetContext>>,
+    node_backend: ResolvedVc<Box<dyn NodeBackend>>,
+    runtime_entries: Option<ResolvedVc<EvaluatableAssets>>,
+) -> Result<Vc<EvaluateEntries>> {
+    let node_backend = node_backend.into_trait_ref().await?;
+    let runtime_module_path = node_backend.runtime_module_path();
+
+    let runtime_asset = asset_context
+        .process(
+            Vc::upcast(FileSource::new(
+                embed_file_path(runtime_module_path).owned().await?,
+            )),
+            ReferenceType::Internal(InnerAssets::empty().to_resolved().await?),
+        )
+        .module()
+        .to_resolved()
+        .await?;
+
+    let entry_module = asset_context
+        .process(
+            Vc::upcast(VirtualSource::new(
+                runtime_asset.ident().await?.path.join("evaluate.js")?,
+                AssetContent::file(
+                    FileContent::Content(File::from(
+                        "import {run} from 'RUNTIME'; run(() => import('INNER'))",
+                    ))
+                    .cell(),
+                ),
+            )),
+            ReferenceType::Internal(ResolvedVc::cell(
+                [
+                    (rcstr!("INNER"), module_asset),
+                    (rcstr!("RUNTIME"), runtime_asset),
+                ]
+                .into(),
+            )),
+        )
+        .module()
+        .to_resolved()
+        .await?;
+
+    let runtime_entries = {
+        let mut entries = vec![];
+        let global_module_path = node_backend.globals_module_path();
+
+        let globals_module = asset_context
+            .process(
+                Vc::upcast(FileSource::new(
+                    embed_file_path(global_module_path).owned().await?,
+                )),
+                ReferenceType::Internal(InnerAssets::empty().to_resolved().await?),
+            )
+            .module();
+
+        let Some(globals_module) = ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(
+            globals_module.to_resolved().await?,
+        ) else {
+            bail!("Internal module is not evaluatable");
+        };
+
+        entries.push(globals_module);
+
+        if let Some(runtime_entries) = runtime_entries {
+            for &entry in &*runtime_entries.await? {
+                entries.push(entry)
+            }
+        }
+        entries
+    };
+
+    Ok(EvaluateEntries {
+        entries: runtime_entries
+            .iter()
+            .copied()
+            .chain(iter::once(ResolvedVc::try_downcast(entry_module).unwrap()))
+            .collect(),
+        main_entry_ident: module_asset.ident().to_resolved().await?,
+    }
+    .cell())
+}
+
+/// Pass the file you cared as `runtime_entries` to invalidate and reload the
+/// evaluated result automatically.
+#[turbo_tasks::function]
+pub async fn evaluate(
+    entries: ResolvedVc<EvaluateEntries>,
+    cwd: FileSystemPath,
+    env: ResolvedVc<Box<dyn ProcessEnv>>,
+    node_backend: ResolvedVc<Box<dyn NodeBackend>>,
+    context_source_for_issue: ResolvedVc<Box<dyn Source>>,
+    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
+    args: Vec<EvaluateArg>,
+    additional_invalidation: ResolvedVc<Completion>,
+    debug: bool,
+) -> Result<Vc<Option<RcStr>>> {
+    custom_evaluate(BasicEvaluateContext {
+        entries,
+        cwd,
+        env,
+        node_backend,
+        context_source_for_issue,
+        chunking_context,
+        module_graph,
+        args,
+        additional_invalidation,
+        debug,
+    })
+    .await
+}
+
+/// Repeatedly pulls from the Operation until we receive a
+/// value/error/end.
+async fn pull_operation<T: EvaluateContext>(
+    operation: &mut Box<dyn Operation>,
+    pool: &EvaluatePool,
+    evaluate_context: &T,
+    state: &mut T::State,
+) -> Result<Option<String>> {
+    let _guard = duration_span!("Node.js evaluation", blocking = false);
+
+    loop {
+        let recv_result = operation.recv().await;
+        let bytes = match recv_result {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                // The Node.js subprocess crashed (or some other IPC failure
+                // closed the connection) before sending a response. Convert
+                // this into a synthesized issue with whatever diagnostic
+                // context the pool managed to capture, so the user sees a
+                // real error message instead of an internal turbo-tasks
+                // execution-failed cascade.
+                let message = match evaluate_context.crash_context_prefix() {
+                    Some(prefix) => format!(
+                        "Node.js subprocess crashed while evaluating {}: {}",
+                        prefix,
+                        PrettyPrintError(&err)
+                    ),
+                    None => format!(
+                        "Node.js subprocess crashed while evaluating: {}",
+                        PrettyPrintError(&err)
+                    ),
+                };
+                let synthetic = StructuredError::from_message("Error".to_string(), message);
+                evaluate_context.emit_error(synthetic, pool).await?;
+                operation.disallow_reuse();
+                return Ok(None);
+            }
+        };
+        let message = serde_json::from_slice(&bytes)?;
+
+        match message {
+            EvalJavaScriptIncomingMessage::Error(error) => {
+                evaluate_context.emit_error(error, pool).await?;
+                // Do not reuse the process in case of error
+                operation.disallow_reuse();
+                // Issue emitted, we want to break but don't want to return an error
+                return Ok(None);
+            }
+            EvalJavaScriptIncomingMessage::End { data } => return Ok(data),
+            EvalJavaScriptIncomingMessage::Info { data } => {
+                evaluate_context
+                    .info(state, serde_json::from_value(data)?, pool)
+                    .await?;
+            }
+            EvalJavaScriptIncomingMessage::Request { id, data } => {
+                match evaluate_context
+                    .request(state, serde_json::from_value(data)?, pool)
+                    .await
+                {
+                    Ok(response) => {
+                        operation
+                            .send(Bytes::from(serde_json::to_vec(
+                                &EvalJavaScriptOutgoingMessage::Result {
+                                    id,
+                                    error: None,
+                                    data: Some(serde_json::to_value(response)?),
+                                },
+                            )?))
+                            .await?;
+                    }
+                    Err(e) => {
+                        operation
+                            .send(Bytes::from(serde_json::to_vec(
+                                &EvalJavaScriptOutgoingMessage::Result {
+                                    id,
+                                    error: Some(PrettyPrintError(&e).to_string()),
+                                    data: None,
+                                },
+                            )?))
+                            .await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct BasicEvaluateContext {
+    entries: ResolvedVc<EvaluateEntries>,
+    cwd: FileSystemPath,
+    env: ResolvedVc<Box<dyn ProcessEnv>>,
+    node_backend: ResolvedVc<Box<dyn NodeBackend>>,
+    context_source_for_issue: ResolvedVc<Box<dyn Source>>,
+    chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    module_graph: ResolvedVc<ModuleGraph>,
+    args: Vec<EvaluateArg>,
+    additional_invalidation: ResolvedVc<Completion>,
+    debug: bool,
+}
+
+impl EvaluateContext for BasicEvaluateContext {
+    type InfoMessage = ();
+    type RequestMessage = ();
+    type ResponseMessage = ();
+    type State = ();
+
+    fn pool(&self) -> OperationVc<EvaluatePool> {
+        get_evaluate_pool(
+            self.entries,
+            self.cwd.clone(),
+            self.env,
+            self.node_backend,
+            self.chunking_context,
+            self.module_graph,
+            self.additional_invalidation,
+            self.debug,
+            EnvVarTracking::WholeEnvTracked,
+        )
+    }
+
+    fn args(&self) -> &[EvaluateArg] {
+        &self.args
+    }
+
+    fn cwd(&self) -> Vc<turbo_tasks_fs::FileSystemPath> {
+        self.cwd.clone().cell()
+    }
+
+    fn context_source_for_issue(&self) -> ResolvedVc<Box<dyn Source>> {
+        self.context_source_for_issue
+    }
+
+    fn keep_alive(&self) -> bool {
+        !self.args.is_empty()
+    }
+
+    async fn emit_error(&self, error: StructuredError, pool: &EvaluatePool) -> Result<()> {
+        EvaluationIssue {
+            error,
+            source: IssueSource::from_source_only(self.context_source_for_issue),
+            assets_for_source_mapping: pool.assets_for_source_mapping,
+            assets_root: pool.assets_root.clone(),
+            root_path: self.chunking_context.root_path().owned().await?,
+            detail: None,
+        }
+        .resolved_cell()
+        .emit();
+        Ok(())
+    }
+
+    async fn info(
+        &self,
+        _state: &mut Self::State,
+        _data: Self::InfoMessage,
+        _pool: &EvaluatePool,
+    ) -> Result<()> {
+        bail!("BasicEvaluateContext does not support info messages")
+    }
+
+    async fn request(
+        &self,
+        _state: &mut Self::State,
+        _data: Self::RequestMessage,
+        _pool: &EvaluatePool,
+    ) -> Result<Self::ResponseMessage> {
+        bail!("BasicEvaluateContext does not support request messages")
+    }
+
+    async fn finish(&self, _state: Self::State, _pool: &EvaluatePool) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// An issue that occurred while evaluating node code.
+#[turbo_tasks::value(shared)]
+pub(crate) struct EvaluationIssue {
+    pub(crate) source: IssueSource,
+    pub(crate) error: StructuredError,
+    pub(crate) assets_for_source_mapping: ResolvedVc<AssetsForSourceMapping>,
+    pub(crate) assets_root: FileSystemPath,
+    pub(crate) root_path: FileSystemPath,
+    /// Optional extra context shown only when log details are enabled — e.g.
+    /// the loader chain that was running when a webpack-loader subprocess
+    /// errored.
+    pub(crate) detail: Option<RcStr>,
+}
+
+#[async_trait]
+#[turbo_tasks::value_impl]
+impl Issue for EvaluationIssue {
+    async fn title(&self) -> Result<StyledString> {
+        Ok(StyledString::Text(rcstr!("Error evaluating Node.js code")))
+    }
+
+    fn stage(&self) -> IssueStage {
+        IssueStage::Transform
+    }
+
+    async fn file_path(&self) -> Result<FileSystemPath> {
+        self.source.file_path().await
+    }
+
+    async fn description(&self) -> Result<Option<StyledString>> {
+        Ok(Some(StyledString::Text(
+            self.error
+                .print(
+                    *self.assets_for_source_mapping,
+                    self.assets_root.clone(),
+                    self.root_path.clone(),
+                    FormattingMode::Plain,
+                )
+                .await?
+                .into(),
+        )))
+    }
+
+    async fn detail(&self) -> Result<Option<StyledString>> {
+        Ok(self.detail.clone().map(StyledString::Text))
+    }
+
+    fn source(&self) -> Option<IssueSource> {
+        Some(self.source)
+    }
+}
+
+/// Node.js child processes could not connect back to the parent process, which
+/// makes it impossible to run any Node.js code (webpack loaders, PostCSS, ...).
+#[turbo_tasks::value(shared)]
+struct NodeJsConnectIssue {
+    /// The source being transformed when the connection failed. The failure is
+    /// unrelated to its contents, but this tells the user which transform hit it.
+    source: IssueSource,
+    /// What was being evaluated, e.g. the loader chain.
+    crash_context: Option<RcStr>,
+    /// Error output of the child process, describing why the connection failed.
+    stderr: RcStr,
+}
+
+#[async_trait]
+#[turbo_tasks::value_impl]
+impl Issue for NodeJsConnectIssue {
+    fn severity(&self) -> IssueSeverity {
+        IssueSeverity::Error
+    }
+
+    async fn title(&self) -> Result<StyledString> {
+        Ok(StyledString::Text(rcstr!(
+            "Node.js worker processes could not connect to Turbopack"
+        )))
+    }
+
+    fn stage(&self) -> IssueStage {
+        IssueStage::Transform
+    }
+
+    async fn file_path(&self) -> Result<FileSystemPath> {
+        self.source.file_path().await
+    }
+
+    fn source(&self) -> Option<IssueSource> {
+        Some(self.source)
+    }
+
+    async fn description(&self) -> Result<Option<StyledString>> {
+        let mut first_line = vec![StyledString::Text(rcstr!(
+            "Turbopack is configured to run webpack loaders and PostCSS transforms in child \
+             processes that communicate with it over a loopback TCP connection, but the child \
+             process was unable to connect"
+        ))];
+
+        if let Some(crash_context) = &self.crash_context {
+            first_line.push(StyledString::Text(rcstr!(" while evaluating ")));
+            first_line.push(StyledString::Code(crash_context.clone()));
+        };
+        first_line.push(StyledString::Text(rcstr!(":")));
+        Ok(Some(StyledString::Stack(vec![
+            StyledString::Line(first_line),
+            StyledString::Code(self.stderr.clone()),
+            StyledString::Line(vec![
+                StyledString::Text(rcstr!(
+                    "This is likely caused by a sandbox or firewall that blocks connections. \
+                     Allow local connections, or run this code using worker threads by setting "
+                )),
+                StyledString::Code(rcstr!(
+                    "experimental.turbopackPluginRuntimeStrategy: 'workerThreads'"
+                )),
+                StyledString::Text(rcstr!(" in your Next.js config.")),
+            ]),
+        ])))
+    }
+
+    fn documentation_link(&self) -> RcStr {
+        rcstr!(
+            "https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopackPluginRuntimeStrategy"
+        )
+    }
+}

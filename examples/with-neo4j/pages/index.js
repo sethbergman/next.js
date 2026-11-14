@@ -1,15 +1,16 @@
-import Head from 'next/head'
-import Link from 'next/link'
-import useSWR from 'swr'
-import fetcher from '../lib/fetcher'
-import Header from '../components/header'
-import Footer from '../components/footer'
+import Head from "next/head";
+import Link from "next/link";
+import useSWR from "swr";
+import fetcher from "../lib/fetcher";
+import Header from "../components/header";
+import Footer from "../components/footer";
 
 export default function Home() {
-  const { data, error } = useSWR('/api/movies', fetcher)
+  const { data, error, isLoading } = useSWR("/api/movies", fetcher);
 
-  if (error) return <div>failed to load</div>
-  if (!data) return <div>loading...</div>
+  if (error) return <div>failed to load</div>;
+  if (isLoading) return <div>loading...</div>;
+  if (!data) return null;
 
   return (
     <div className="container">
@@ -43,15 +44,13 @@ export default function Home() {
                   <th>{index + 1}</th>
                   <td>
                     <Link
-                      href="/movie/[title]"
-                      as={{
-                        pathname: `/movie/${encodeURIComponent(movie.title)}`,
-                      }}
+                      href={`/movie/${encodeURIComponent(movie.title)}`}
+                      className="link"
                     >
-                      <a className="link">{movie.title}</a>
+                      {movie.title}
                     </Link>
                   </td>
-                  <td>{movie.released.low}</td>
+                  <td>{movie.released}</td>
                   <td>{movie.tagline}</td>
                   <td>
                     <ul>
@@ -65,12 +64,10 @@ export default function Home() {
                       {movie.actors.map((actor) => (
                         <li key={actor}>
                           <Link
-                            href="/actor/[name]"
-                            as={{
-                              pathname: `/actor/${encodeURIComponent(actor)}`,
-                            }}
+                            href={`/actor/${encodeURIComponent(actor)}`}
+                            className="link"
                           >
-                            <a className="link">{actor}</a>
+                            {actor}
                           </Link>
                         </li>
                       ))}
@@ -135,5 +132,5 @@ export default function Home() {
         }
       `}</style>
     </div>
-  )
+  );
 }

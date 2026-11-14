@@ -1,18 +1,14 @@
-// types only import
-import {
+import type {
   Compiler as WebpackCompiler,
   Template as WebpackTemplate,
-  // @ts-ignore exists in webpack 5
   RuntimeModule as WebpackRuntimeModule,
-  // @ts-ignore exists in webpack 5
   RuntimeGlobals as WebpackRuntimeGlobals,
-  // @ts-ignore exists in webpack 5
-  compilation as WebpackCompilation,
+  Compilation as WebpackCompilation,
 } from 'webpack'
 
 // Shared between webpack 4 and 5:
 function injectRefreshFunctions(
-  compilation: WebpackCompilation.Compilation,
+  compilation: WebpackCompilation,
   Template: typeof WebpackTemplate
 ) {
   const hookVars: any = (compilation.mainTemplate.hooks as any).localVars
@@ -97,8 +93,7 @@ function webpack5(this: ReactFreshWebpackPlugin, compiler: WebpackCompiler) {
     }
 
     generate() {
-      // @ts-ignore This exists in webpack 5
-      const { runtimeTemplate } = this.compilation
+      const { runtimeTemplate } = this.compilation!
       return Template.asString([
         `if (${RuntimeGlobals.interceptModuleExecution}) {`,
         `${
@@ -110,6 +105,13 @@ function webpack5(this: ReactFreshWebpackPlugin, compiler: WebpackCompiler) {
           `options.factory = ${runtimeTemplate.basicFunction(
             'moduleObject, moduleExports, webpackRequire',
             [
+              // If the original factory is missing, e.g. due to race condition
+              // when compiling multiple entries concurrently, recover by doing
+              // a full page reload.
+              'if (!originalFactory) {',
+              Template.indent('document.location.reload();'),
+              Template.indent('return;'),
+              '}',
               // Legacy CSS implementations will `eval` browser code in a Node.js
               // context to extract CSS. For backwards compatibility, we need to check
               // we're in a browser context before continuing.
@@ -142,11 +144,9 @@ function webpack5(this: ReactFreshWebpackPlugin, compiler: WebpackCompiler) {
   compiler.hooks.compilation.tap('ReactFreshWebpackPlugin', (compilation) => {
     injectRefreshFunctions(compilation, Template)
 
-    // @ts-ignore Exists in webpack 5
     compilation.hooks.additionalTreeRuntimeRequirements.tap(
       'ReactFreshWebpackPlugin',
       (chunk: any) => {
-        // @ts-ignore Exists in webpack 5
         compilation.addRuntimeModule(chunk, new ReactRefreshRuntimeModule())
       }
     )
@@ -161,7 +161,12 @@ class ReactFreshWebpackPlugin {
   RuntimeModule: typeof WebpackRuntimeModule
   Template: typeof WebpackTemplate
   constructor(
-    { version, RuntimeGlobals, RuntimeModule, Template } = require('webpack')
+    {
+      version,
+      RuntimeGlobals,
+      RuntimeModule,
+      Template,
+    } = require('webpack') as typeof import('webpack')
   ) {
     this.webpackMajorVersion = parseInt(version ?? '', 10)
     this.RuntimeGlobals = RuntimeGlobals

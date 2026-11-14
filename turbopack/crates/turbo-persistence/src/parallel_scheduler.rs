@@ -1,0 +1,176 @@
+/// Runs turbo-persistence's CPU-parallel work.
+///
+/// Every method blocks until all of its work has finished, and may run the work on the calling
+/// thread. If an implementation needs to block an async runtime thread while waiting (e.g. tokio's
+/// `block_in_place`), it handles that internally; callers don't wrap work in a separate hand-off.
+pub trait ParallelScheduler: Clone + Sync + Send {
+    /// The number of tasks this scheduler can run at the same time. Always at least 1.
+    fn parallelism(&self) -> usize;
+
+    fn parallel_for_each<T>(&self, items: &[T], f: impl Fn(&T) + Send + Sync)
+    where
+        T: Sync;
+
+    fn try_parallel_for_each<'l, T, E>(
+        &self,
+        items: &'l [T],
+        f: impl (Fn(&'l T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Sync,
+        E: Send + 'static;
+
+    fn try_parallel_for_each_mut<'l, T, E>(
+        &self,
+        items: &'l mut [T],
+        f: impl (Fn(&'l mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static;
+
+    /// Like [`ParallelScheduler::try_parallel_for_each_mut`], but `items` are already chunked by
+    /// the caller: every item runs as its own task, and implementations must not group items
+    /// into larger chunks.
+    fn try_parallel_for_each_task_mut<T, E>(
+        &self,
+        items: &mut [T],
+        f: impl (Fn(&mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static;
+
+    fn try_parallel_for_each_owned<T, E>(
+        &self,
+        items: Vec<T>,
+        f: impl (Fn(T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send + 'static;
+
+    fn parallel_map_collect<'l, Item, PerItemResult, Result>(
+        &self,
+        items: &'l [Item],
+        f: impl Fn(&'l Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Sync,
+        PerItemResult: Send + Sync + 'l,
+        Result: FromIterator<PerItemResult>;
+
+    fn parallel_map_collect_owned<Item, PerItemResult, Result>(
+        &self,
+        items: Vec<Item>,
+        f: impl Fn(Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Send + Sync,
+        PerItemResult: Send + Sync,
+        Result: FromIterator<PerItemResult>;
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SerialScheduler;
+
+impl ParallelScheduler for SerialScheduler {
+    fn parallelism(&self) -> usize {
+        1
+    }
+
+    fn parallel_for_each<T>(&self, items: &[T], f: impl Fn(&T) + Send + Sync)
+    where
+        T: Sync,
+    {
+        for item in items {
+            f(item);
+        }
+    }
+
+    fn try_parallel_for_each<'l, T, E>(
+        &self,
+        items: &'l [T],
+        f: impl (Fn(&'l T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Sync,
+        E: Send,
+    {
+        for item in items {
+            f(item)?;
+        }
+        Ok(())
+    }
+
+    fn try_parallel_for_each_mut<'l, T, E>(
+        &self,
+        items: &'l mut [T],
+        f: impl (Fn(&'l mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Sync,
+        E: Send,
+    {
+        for item in items {
+            f(item)?;
+        }
+        Ok(())
+    }
+
+    fn try_parallel_for_each_task_mut<T, E>(
+        &self,
+        items: &mut [T],
+        f: impl (Fn(&mut T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send + Sync,
+        E: Send,
+    {
+        for item in items {
+            f(item)?;
+        }
+        Ok(())
+    }
+
+    fn try_parallel_for_each_owned<T, E>(
+        &self,
+        items: Vec<T>,
+        f: impl (Fn(T) -> Result<(), E>) + Send + Sync,
+    ) -> Result<(), E>
+    where
+        T: Sync,
+        E: Send,
+    {
+        for item in items {
+            f(item)?;
+        }
+        Ok(())
+    }
+
+    fn parallel_map_collect<'l, Item, PerItemResult, Result>(
+        &self,
+        items: &'l [Item],
+        f: impl Fn(&'l Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Sync,
+        PerItemResult: Send + Sync + 'l,
+        Result: FromIterator<PerItemResult>,
+    {
+        items.iter().map(f).collect()
+    }
+
+    fn parallel_map_collect_owned<Item, PerItemResult, Result>(
+        &self,
+        items: Vec<Item>,
+        f: impl Fn(Item) -> PerItemResult + Send + Sync,
+    ) -> Result
+    where
+        Item: Send + Sync,
+        PerItemResult: Send + Sync,
+        Result: FromIterator<PerItemResult>,
+    {
+        items.into_iter().map(f).collect()
+    }
+}

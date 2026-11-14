@@ -1,5 +1,14 @@
+/** @type {import('next').NextConfig} */
 module.exports = {
   images: {
-    domains: ['assets.vercel.com'],
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "assets.vercel.com",
+        port: "",
+        pathname: "/image/upload/**",
+        search: "",
+      },
+    ],
   },
-}
+};

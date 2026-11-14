@@ -1,0 +1,315 @@
+use std::{io::Write, sync::LazyLock};
+
+use anyhow::{Result, bail};
+use regex::Regex;
+use smallvec::smallvec;
+use tracing::Instrument;
+use turbo_rcstr::rcstr;
+use turbo_tasks::{FxIndexMap, FxIndexSet, JoinIterExt, ResolvedVc, ValueToString, Vc};
+use turbo_tasks_fs::{FileContent, rope::Rope};
+use turbopack::{ModuleAssetContext, module_options::CustomModuleType};
+use turbopack_core::{
+    asset::Asset,
+    chunk::{AsyncModuleInfo, ChunkableModule, ChunkingContext},
+    code_builder::CodeBuilder,
+    compile_time_info::{
+        CompileTimeDefineValue, CompileTimeInfo, DefinableNameSegmentRef, DefinableNameSegmentRefs,
+        FreeVarReference,
+    },
+    context::AssetContext,
+    ident::AssetIdent,
+    module::{Module, ModuleSideEffects},
+    module_graph::ModuleGraph,
+    reference_type::ReferenceType,
+    source::{OptionSource, Source},
+    source_map::{
+        GenerateSourceMap, SourceMapGenerationOptions, SourceMapType, SourceMaps,
+        structured::StructuredSourceMap,
+    },
+};
+use turbopack_ecmascript::{
+    EcmascriptInputTransforms,
+    chunk::{
+        EcmascriptChunkItemContent, EcmascriptChunkItemOptions, EcmascriptChunkPlaceable,
+        EcmascriptExports, ecmascript_chunk_item,
+    },
+    source_map::{extract_source_mapping_url_from_content, parse_source_map_comment},
+    utils::StringifyJs,
+};
+
+#[turbo_tasks::value(shared)]
+pub struct RawEcmascriptModuleType {}
+
+#[turbo_tasks::value_impl]
+impl CustomModuleType for RawEcmascriptModuleType {
+    #[turbo_tasks::function]
+    async fn create_module(
+        &self,
+        source: Vc<Box<dyn Source>>,
+        module_asset_context: Vc<ModuleAssetContext>,
+        _reference_type: ReferenceType,
+    ) -> Result<Vc<Box<dyn Module>>> {
+        Ok(Vc::upcast(RawEcmascriptModule::new(
+            source,
+            module_asset_context.compile_time_info(),
+            module_asset_context
+                .module_options_context()
+                .await?
+                .ecmascript
+                .source_map_generation_options,
+        )))
+    }
+
+    #[turbo_tasks::function]
+    fn extend_ecmascript_transforms(
+        self: Vc<Self>,
+        _preprocess: Vc<EcmascriptInputTransforms>,
+        _main: Vc<EcmascriptInputTransforms>,
+        _postprocess: Vc<EcmascriptInputTransforms>,
+    ) -> Vc<Box<dyn CustomModuleType>> {
+        // Just ignore them
+        Vc::upcast(self)
+    }
+}
+
+#[turbo_tasks::value]
+pub struct RawEcmascriptModule {
+    source: ResolvedVc<Box<dyn Source>>,
+    compile_time_info: ResolvedVc<CompileTimeInfo>,
+    source_map_generation_options: SourceMapGenerationOptions,
+}
+
+#[turbo_tasks::value_impl]
+impl RawEcmascriptModule {
+    #[turbo_tasks::function]
+    pub fn new(
+        source: ResolvedVc<Box<dyn Source>>,
+        compile_time_info: ResolvedVc<CompileTimeInfo>,
+        source_map_generation_options: SourceMapGenerationOptions,
+    ) -> Vc<Self> {
+        RawEcmascriptModule {
+            source,
+            compile_time_info,
+            source_map_generation_options,
+        }
+        .cell()
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl Module for RawEcmascriptModule {
+    #[turbo_tasks::function]
+    async fn ident(&self) -> Result<Vc<AssetIdent>> {
+        Ok(self
+            .source
+            .ident()
+            .owned()
+            .await?
+            .with_modifier(rcstr!("raw"))
+            .into_vc())
+    }
+
+    #[turbo_tasks::function]
+    fn source(&self) -> Vc<OptionSource> {
+        Vc::cell(Some(self.source))
+    }
+
+    #[turbo_tasks::function]
+    fn side_effects(self: Vc<Self>) -> Vc<ModuleSideEffects> {
+        ModuleSideEffects::SideEffectful.cell()
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl ChunkableModule for RawEcmascriptModule {
+    #[turbo_tasks::function]
+    fn as_chunk_item(
+        self: ResolvedVc<Self>,
+        module_graph: ResolvedVc<ModuleGraph>,
+        chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    ) -> Vc<Box<dyn turbopack_core::chunk::ChunkItem>> {
+        ecmascript_chunk_item(ResolvedVc::upcast(self), module_graph, chunking_context)
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl EcmascriptChunkPlaceable for RawEcmascriptModule {
+    #[turbo_tasks::function]
+    fn get_exports(&self) -> Vc<EcmascriptExports> {
+        EcmascriptExports::CommonJs(None).cell()
+    }
+
+    #[turbo_tasks::function]
+    async fn chunk_item_content(
+        self: Vc<Self>,
+        _chunking_context: Vc<Box<dyn ChunkingContext>>,
+        _module_graph: Vc<ModuleGraph>,
+        _async_module_info: Option<Vc<AsyncModuleInfo>>,
+        _estimated: bool,
+    ) -> Result<Vc<EcmascriptChunkItemContent>> {
+        let span = tracing::info_span!(
+            "code generation raw module",
+            name = display(self.ident().to_string().await?)
+        );
+
+        async {
+            let module = self.await?;
+            let source = module.source;
+            let content = source.content().file_content().await?;
+            let content = match &*content {
+                FileContent::Content(file) => file.content(),
+                FileContent::NotFound => bail!("RawEcmascriptModule content not found"),
+            };
+
+            static ENV_REGEX: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"process\.env\.([a-zA-Z0-9_]+)").unwrap());
+
+            let content_str = content.to_str()?;
+
+            let mut env_vars = FxIndexSet::default();
+            for (_, [name]) in ENV_REGEX.captures_iter(&content_str).map(|c| c.extract()) {
+                env_vars.insert(name);
+            }
+
+            let generation = module.source_map_generation_options;
+            let mut code = CodeBuilder::new(false, generation);
+            if !env_vars.is_empty() {
+                let replacements = module.compile_time_info.await?.free_var_references;
+                code += "var process = {env:\n";
+                writeln!(
+                    code,
+                    "{}",
+                    StringifyJs(
+                        &env_vars
+                            .into_iter()
+                            .map(async |name| {
+                                Ok((
+                                    name,
+                                    if let Some(value) = replacements
+                                        .get(&DefinableNameSegmentRefs(smallvec![
+                                            DefinableNameSegmentRef::Name("process"),
+                                            DefinableNameSegmentRef::Name("env"),
+                                            DefinableNameSegmentRef::Name(name),
+                                        ]))
+                                        .await?
+                                    {
+                                        let value = match &*value {
+                                            FreeVarReference::Value(
+                                                CompileTimeDefineValue::String(value),
+                                            ) => serde_json::Value::String(value.to_string()),
+                                            FreeVarReference::Value(
+                                                CompileTimeDefineValue::Bool(value),
+                                            ) => serde_json::Value::Bool(*value),
+                                            _ => {
+                                                bail!(
+                                                    "Unexpected replacement for \
+                                                     process.env.{name} in RawEcmascriptModule: \
+                                                     {value:?}"
+                                                );
+                                            }
+                                        };
+                                        Some(value)
+                                    } else {
+                                        None
+                                    },
+                                ))
+                            })
+                            .join()
+                            .await
+                            .into_iter()
+                            .collect::<Result<FxIndexMap<_, _>>>()?
+                    )
+                )?;
+                code += "};\n";
+            }
+
+            code += "(function(){\n";
+            let source_mapping_url = extract_source_mapping_url_from_content(&content_str);
+            let full_source_map = if generation.full {
+                if let Some((source_map, _)) =
+                    parse_source_map_comment(source, source_mapping_url, &self.ident().await?.path)
+                        .await?
+                {
+                    let full_source_map =
+                        source_map.generate_source_map(SourceMapType::Full).await?;
+                    full_source_map.as_content().map(|f| f.content().clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let shallow_source_map = if generation.shallow
+                || (generation.full && full_source_map.is_none())
+            {
+                let mut map = swc_sourcemap::SourceMapBuilder::new(None);
+                let source_id = map.add_source(self.ident().to_string().await?.to_string().into());
+                map.set_source_contents(source_id, Some(content_str.clone().into_owned().into()));
+                for (line, _) in content_str.split_inclusive('\n').enumerate() {
+                    map.add_raw(line as u32, 0, line as u32, 0, Some(source_id), None, false);
+                }
+                let mut bytes = Vec::new();
+                map.into_sourcemap().to_writer(&mut bytes)?;
+                Some(Rope::from(bytes))
+            } else {
+                None
+            };
+            let source_maps = if generation.full && generation.shallow && full_source_map.is_none()
+            {
+                SourceMaps::Shared(shallow_source_map.unwrap())
+            } else {
+                SourceMaps::new(
+                    if generation.full {
+                        full_source_map.or_else(|| shallow_source_map.clone())
+                    } else {
+                        None
+                    },
+                    if generation.shallow {
+                        shallow_source_map
+                    } else {
+                        None
+                    },
+                )
+            };
+            code.push_source(content, source_maps)?;
+
+            // Add newline in case the raw code had a comment as the last line and no final newline.
+            code += "\n})();\n";
+
+            let code = code.build();
+            let source_maps = code.source_maps()?.try_map(|source_map| {
+                static SECTIONS_REGEX: LazyLock<Regex> =
+                    LazyLock::new(|| Regex::new(r#"sections"[\s\n]*:"#).unwrap());
+                let source_map = if !SECTIONS_REGEX.is_match(&source_map.to_str()?) {
+                    source_map
+                } else {
+                    let _span = tracing::span!(
+                        tracing::Level::WARN,
+                        "flattening index source map in RawEcmascriptModule"
+                    )
+                    .entered();
+                    match swc_sourcemap::lazy::decode(&source_map.to_bytes())? {
+                        swc_sourcemap::lazy::DecodedMap::Regular(_) => source_map,
+                        // Output chunks cannot embed nested index maps.
+                        swc_sourcemap::lazy::DecodedMap::Index(map) => {
+                            Rope::from(serde_json::to_vec(&map.flatten()?.into_raw_sourcemap())?)
+                        }
+                    }
+                };
+                StructuredSourceMap::from_json(&source_map)
+            })?;
+            Ok(EcmascriptChunkItemContent {
+                source_maps,
+                inner_code: code.into_source_code(),
+                options: EcmascriptChunkItemOptions {
+                    module_and_exports: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .cell())
+        }
+        .instrument(span)
+        .await
+    }
+}

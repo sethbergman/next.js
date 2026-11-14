@@ -1,0 +1,348 @@
+import {
+  nextTestSetup,
+  FileRef,
+  patchFileWithDeployEnvAssignments,
+  isNextDeploy,
+  isNextDev,
+} from 'e2e-utils'
+import {
+  waitForRedbox,
+  waitForNoRedbox,
+  getRedboxCallStack,
+  getRedboxSource,
+} from 'next-test-utils'
+import * as path from 'path'
+import { realpathSync } from 'fs'
+import { pathToFileURL } from 'url'
+
+describe('non-root-project-monorepo', () => {
+  const { next, isTurbopack, isRspack } = nextTestSetup({
+    files: {
+      apps: new FileRef(path.resolve(__dirname, 'apps')),
+      packages: new FileRef(path.resolve(__dirname, 'packages')),
+      // Deliberately shadows apps/web/content, to pin down which one a
+      // `/`-rooted import resolves from.
+      content: new FileRef(path.resolve(__dirname, 'content')),
+      'vercel.json': new FileRef(path.resolve(__dirname, 'vercel.json')),
+      'pnpm-workspace.yaml': `packages:
+      - 'apps/*'
+      - 'packages/*'
+      `,
+    },
+    overrideFiles: {
+      'apps/web/next.config.js': patchFileWithDeployEnvAssignments(
+        path.join(__dirname, 'apps/web/next.config.js')
+      ),
+    },
+    packageJson: require('./package.json'),
+    buildCommand: 'pnpm build',
+    startCommand: isNextDev ? 'pnpm dev' : 'pnpm start',
+    installCommand: 'pnpm i',
+  })
+
+  function sourceFileUrl(file: string) {
+    // Server bundles preserve the source path from the build environment.
+    if (isNextDeploy) {
+      return new URL(file, 'file:///vercel/path0/apps/web/').href
+    }
+    // Turbopack expands Windows 8.3 names (e.g. RUNNER~1) in source paths.
+    const testDir =
+      process.platform === 'win32' && isTurbopack
+        ? realpathSync.native(next.testDir)
+        : realpathSync(next.testDir)
+    const filePath = path.join(testDir, 'apps/web', file)
+    return pathToFileURL(filePath).href
+  }
+
+  describe('server relative import', () => {
+    it('should resolve a `/`-rooted import from the project directory, not the workspace root', async () => {
+      // `/content/where` exists both in apps/web (the project directory) and at
+      // the workspace root, so the value says which root was used.
+      const $ = await next.render$('/server-relative-import')
+      expect($('#where').text()).toBe('FROM-PROJECT-DIR')
+    })
+  })
+
+  describe('monorepo-package', () => {
+    it('should work during RSC', async () => {
+      const $ = await next.render$('/monorepo-package-rsc')
+      expect($('p').text()).toBe('Hello Typescript')
+    })
+
+    it('should work during SSR', async () => {
+      const $ = await next.render$('/monorepo-package-ssr')
+      expect($('p').text()).toBe('Hello Typescript')
+    })
+
+    it('should work on client-side', async () => {
+      const browser = await next.browser('/monorepo-package-ssr')
+      expect(await browser.elementByCss('p').text()).toBe('Hello Typescript')
+      await waitForNoRedbox(browser)
+      expect(await browser.elementByCss('p').text()).toBe('Hello Typescript')
+      await browser.close()
+    })
+  })
+
+  // Deployed server bundles embed the build machine's source path, and
+  // `sourceFileUrl()` hardcodes it as Vercel's build directory
+  // (`/vercel/path0`). Other hosts build in a different directory.
+  // @force-gate !deploy || vercel
+  describe('import.meta.url', () => {
+    it('should work during RSC', async () => {
+      const $ = await next.render$('/import-meta-url-rsc')
+      expect($('p').text()).toBe(
+        sourceFileUrl('app/import-meta-url-rsc/page.tsx')
+      )
+    })
+
+    it('should work during SSR', async () => {
+      const $ = await next.render$('/import-meta-url-ssr')
+      expect($('p').text()).toBe(
+        sourceFileUrl('app/import-meta-url-ssr/page.tsx')
+      )
+    })
+
+    it('should work on client-side', async () => {
+      const browser = await next.browser('/import-meta-url-ssr')
+      await waitForNoRedbox(browser)
+      if (isTurbopack) {
+        // Turbopack intentionally doesn't expose the full path to the browser bundles
+        expect(await browser.elementByCss('p').text()).toBe(
+          'file:///ROOT/apps/web/app/import-meta-url-ssr/page.tsx'
+        )
+      } else {
+        expect(await browser.elementByCss('p').text()).toBe(
+          sourceFileUrl('app/import-meta-url-ssr/page.tsx')
+        )
+      }
+      await browser.close()
+    })
+
+    // Verifies that non-URL-safe characters in file paths (here: a literal
+    // space) are correctly percent-encoded in the resulting `file://` URI.
+    describe('non-url-safe characters', () => {
+      it('should encode special chars during RSC', async () => {
+        const $ = await next.render$('/import-meta-url-encoded-rsc')
+        expect($('p').text()).toBe(
+          sourceFileUrl('app/import-meta-url-encoded-rsc/with space.ts')
+        )
+      })
+
+      it('should encode special chars during SSR', async () => {
+        const $ = await next.render$('/import-meta-url-encoded-ssr')
+        expect($('p').text()).toBe(
+          sourceFileUrl('app/import-meta-url-encoded-ssr/with space.ts')
+        )
+      })
+
+      it('should encode special chars on client-side', async () => {
+        const browser = await next.browser('/import-meta-url-encoded-ssr')
+        await waitForNoRedbox(browser)
+        if (isTurbopack) {
+          // Turbopack intentionally doesn't expose the full path to the browser bundles
+          expect(await browser.elementByCss('p').text()).toBe(
+            'file:///ROOT/apps/web/app/import-meta-url-encoded-ssr/with%20space.ts'
+          )
+        } else {
+          expect(await browser.elementByCss('p').text()).toBe(
+            sourceFileUrl('app/import-meta-url-encoded-ssr/with space.ts')
+          )
+        }
+        await browser.close()
+      })
+    })
+  })
+
+  if (isNextDev) {
+    describe('source-maps', () => {
+      it('should work on RSC', async () => {
+        const browser = await next.browser('/source-maps-rsc')
+        await waitForRedbox(browser)
+
+        if (isTurbopack) {
+          // TODO the function name should be hidden
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:7) @ module evaluation
+
+           > 1 | throw new Error('Expected error')
+               |       ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "module evaluation app/separate-file.ts (1:7)",
+             "innerArrowFunction app/source-maps-rsc/page.tsx (13:28)",
+             "innerFunction app/source-maps-rsc/page.tsx (10:3)",
+             "Page app/source-maps-rsc/page.tsx (4:5)",
+           ]
+          `)
+        } else if (isRspack) {
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:11) @ eval
+
+           > 1 | throw new Error('Expected error')
+               |           ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:11)",
+             "<FIXME-file-protocol>",
+             "<FIXME-file-protocol>",
+             "innerArrowFunction app/source-maps-rsc/page.tsx (14:3)",
+             "innerFunction app/source-maps-rsc/page.tsx (10:3)",
+             "Page app/source-maps-rsc/page.tsx (4:5)",
+           ]
+          `)
+        } else {
+          // TODO the function name is incorrect
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:11) @ eval
+
+           > 1 | throw new Error('Expected error')
+               |           ^
+             2 |"
+          `)
+          // TODO(veil): webpack runtime code shouldn't be included in stack trace (see https://linear.app/vercel/issue/NDX-509)
+          // TODO(veil): https://linear.app/vercel/issue/NDX-677
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:11)",
+             "<FIXME-file-protocol>",
+             "innerArrowFunction app/source-maps-rsc/page.tsx (14:3)",
+             "innerFunction app/source-maps-rsc/page.tsx (10:3)",
+             "Page app/source-maps-rsc/page.tsx (4:5)",
+           ]
+          `)
+        }
+        await browser.close()
+      })
+
+      it('should work on SSR', async () => {
+        const browser = await next.browser('/source-maps-ssr')
+        await waitForRedbox(browser)
+
+        if (isTurbopack) {
+          // TODO the function name should be hidden
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:7) @ module evaluation
+
+           > 1 | throw new Error('Expected error')
+               |       ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "module evaluation app/separate-file.ts (1:7)",
+             "innerArrowFunction app/source-maps-ssr/page.tsx (15:28)",
+             "innerFunction app/source-maps-ssr/page.tsx (12:3)",
+             "Page app/source-maps-ssr/page.tsx (6:5)",
+           ]
+          `)
+        } else if (isRspack) {
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:7) @ eval
+
+           > 1 | throw new Error('Expected error')
+               |       ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:7)",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+             "innerArrowFunction app/source-maps-ssr/page.tsx (16:3)",
+             "innerFunction app/source-maps-ssr/page.tsx (12:3)",
+             "Page app/source-maps-ssr/page.tsx (6:5)",
+           ]
+          `)
+        } else {
+          // TODO the function name should be hidden
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+            "app/separate-file.ts (1:7) @ eval
+
+            > 1 | throw new Error('Expected error')
+                |       ^
+              2 |"
+          `)
+          // TODO(veil): webpack runtime code shouldn't be included in stack trace (see https://linear.app/vercel/issue/NDX-509)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:7)",
+             "<FIXME-next-dist-dir>",
+             "innerArrowFunction app/source-maps-ssr/page.tsx (16:3)",
+             "innerFunction app/source-maps-ssr/page.tsx (12:3)",
+             "Page app/source-maps-ssr/page.tsx (6:5)",
+           ]
+          `)
+        }
+        await browser.close()
+      })
+
+      it('should work on client-side', async () => {
+        const browser = await next.browser('/source-maps-client')
+        await waitForRedbox(browser)
+
+        if (isTurbopack) {
+          // TODO the function name should be hidden
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:7) @ module evaluation
+
+           > 1 | throw new Error('Expected error')
+               |       ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "module evaluation app/separate-file.ts (1:7)",
+             "innerArrowFunction app/source-maps-client/page.tsx (16:28)",
+             "innerFunction app/source-maps-client/page.tsx (13:3)",
+             "effectCallback app/source-maps-client/page.tsx (7:5)",
+           ]
+          `)
+        } else if (isRspack) {
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+           "app/separate-file.ts (1:7) @ eval
+
+           > 1 | throw new Error('Expected error')
+               |       ^
+             2 |"
+          `)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:7)",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+             "<FIXME-next-dist-dir>",
+             "innerArrowFunction app/source-maps-client/page.tsx (17:3)",
+             "innerFunction app/source-maps-client/page.tsx (13:3)",
+             "effectCallback app/source-maps-client/page.tsx (7:5)",
+           ]
+          `)
+        } else {
+          // TODO the function name should be hidden
+          expect(await getRedboxSource(browser)).toMatchInlineSnapshot(`
+            "app/separate-file.ts (1:7) @ eval
+
+            > 1 | throw new Error('Expected error')
+                |       ^
+              2 |"
+          `)
+          // TODO(veil): webpack runtime code shouldn't be included in stack trace (see https://linear.app/vercel/issue/NDX-509)
+          expect(await getRedboxCallStack(browser)).toMatchInlineSnapshot(`
+           [
+             "eval app/separate-file.ts (1:7)",
+             "<FIXME-next-dist-dir>",
+             "innerArrowFunction app/source-maps-client/page.tsx (17:3)",
+             "innerFunction app/source-maps-client/page.tsx (13:3)",
+             "effectCallback app/source-maps-client/page.tsx (7:5)",
+           ]
+          `)
+        }
+        await browser.close()
+      })
+    })
+  }
+})

@@ -3,10 +3,14 @@
     "module": "commonjs",
     "sourceMap": true,
     "esModuleInterop": true,
-    "target": "es2015",
-    "downlevelIteration": true,
-    "preserveWatchOutput": true
+    "noImplicitAny": false,
+    "target": "ES2022",
+    "preserveWatchOutput": true,
+    "strictFunctionTypes": false,
+    "strictNullChecks": false,
+    "types": ["node"],
+    "useUnknownInCatchVariables": false
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "transforms/__testfixtures__/**"]
 }

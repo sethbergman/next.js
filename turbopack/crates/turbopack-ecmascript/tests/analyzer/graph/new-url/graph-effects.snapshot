@@ -1,0 +1,216 @@
+[
+    FreeVar {
+        var: "URL",
+        ast_path: [
+            Program(
+                Module,
+            ),
+            Module(
+                Body(
+                    0,
+                ),
+            ),
+            ModuleItem(
+                Stmt,
+            ),
+            Stmt(
+                Decl,
+            ),
+            Decl(
+                Var,
+            ),
+            VarDecl(
+                Decls(
+                    0,
+                ),
+            ),
+            VarDeclarator(
+                Init,
+            ),
+            Expr(
+                New,
+            ),
+            NewExpr(
+                Callee,
+            ),
+            Expr(
+                Ident,
+            ),
+        ],
+        span: 17..20,
+    },
+    Call {
+        func: FreeVar(
+            "URL",
+        ),
+        args: [
+            Value(
+                Constant(
+                    Str(
+                        Atom(
+                            "./worker.ts",
+                        ),
+                    ),
+                ),
+                [],
+            ),
+            Value(
+                Member(
+                    3,
+                    WellKnownObject(
+                        ImportMeta,
+                    ),
+                    Constant(
+                        Str(
+                            Atom(
+                                "url",
+                            ),
+                        ),
+                    ),
+                ),
+                [
+                    Member {
+                        obj: WellKnownObject(
+                            ImportMeta,
+                        ),
+                        prop: Constant(
+                            Str(
+                                Atom(
+                                    "url",
+                                ),
+                            ),
+                        ),
+                        base_effects: [
+                            ImportMeta {
+                                ast_path: [
+                                    Program(
+                                        Module,
+                                    ),
+                                    Module(
+                                        Body(
+                                            0,
+                                        ),
+                                    ),
+                                    ModuleItem(
+                                        Stmt,
+                                    ),
+                                    Stmt(
+                                        Decl,
+                                    ),
+                                    Decl(
+                                        Var,
+                                    ),
+                                    VarDecl(
+                                        Decls(
+                                            0,
+                                        ),
+                                    ),
+                                    VarDeclarator(
+                                        Init,
+                                    ),
+                                    Expr(
+                                        New,
+                                    ),
+                                    NewExpr(
+                                        Args(
+                                            1,
+                                        ),
+                                    ),
+                                    ExprOrSpread(
+                                        Expr,
+                                    ),
+                                    Expr(
+                                        Member,
+                                    ),
+                                    MemberExpr(
+                                        Obj,
+                                    ),
+                                    Expr(
+                                        MetaProp,
+                                    ),
+                                ],
+                                span: 36..47,
+                            },
+                        ],
+                        ast_path: [
+                            Program(
+                                Module,
+                            ),
+                            Module(
+                                Body(
+                                    0,
+                                ),
+                            ),
+                            ModuleItem(
+                                Stmt,
+                            ),
+                            Stmt(
+                                Decl,
+                            ),
+                            Decl(
+                                Var,
+                            ),
+                            VarDecl(
+                                Decls(
+                                    0,
+                                ),
+                            ),
+                            VarDeclarator(
+                                Init,
+                            ),
+                            Expr(
+                                New,
+                            ),
+                            NewExpr(
+                                Args(
+                                    1,
+                                ),
+                            ),
+                            ExprOrSpread(
+                                Expr,
+                            ),
+                            Expr(
+                                Member,
+                            ),
+                        ],
+                        span: 36..51,
+                        in_truthiness_context: false,
+                    },
+                ],
+            ),
+        ],
+        ast_path: [
+            Program(
+                Module,
+            ),
+            Module(
+                Body(
+                    0,
+                ),
+            ),
+            ModuleItem(
+                Stmt,
+            ),
+            Stmt(
+                Decl,
+            ),
+            Decl(
+                Var,
+            ),
+            VarDecl(
+                Decls(
+                    0,
+                ),
+            ),
+            VarDeclarator(
+                Init,
+            ),
+            Expr(
+                New,
+            ),
+        ],
+        span: 13..52,
+        in_try: false,
+        new: true,
+    },
+]

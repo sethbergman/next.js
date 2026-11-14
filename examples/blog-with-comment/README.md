@@ -4,7 +4,7 @@ This project adds commenting functionality to [Next.js blog application](https:/
 
 The comment box requires Auth0 authentication for users to add new comments. A user can delete their own comment. Also admin user can delete any comment.
 
-Comments are stored in Serverless Redis ([Upstash](http://upstash.com/)).
+Comments are stored in Serverless Redis ([Upstash](https://upstash.com/)).
 
 ### Demo
 
@@ -46,13 +46,15 @@ Go to the [Upstash Console](https://console.upstash.com/) and create a new datab
      to `https://myapp.com/` when deploying your application.
    - **Allowed Logout URLs**: Should be set to `http://localhost:3000/` when testing locally or typically
      to `https://myapp.com/` when deploying your application.
+   - **Allowed Web Origins**: Should be set to `http://localhost:3000` when testing locally or typically
+     to `https://myapp.com/` when deploying your application.
 4. Save the settings.
 
 #### Auth0 environment
 
 - `NEXT_PUBLIC_AUTH0_DOMAIN`: Can be found in the Auth0 dashboard under `settings`.
 - `NEXT_PUBLIC_AUTH0_CLIENT_ID`: Can be found in the Auth0 dashboard under `settings`.
-- `NEXT_PUBLIC_AUTH0_ADMIN_EMAIL`: This is the email of the admin user which you use while singing in Auth0. Admin is able to delete any comment.
+- `NEXT_PUBLIC_AUTH0_ADMIN_EMAIL`: This is the email of the admin user which you use while signing in Auth0. Admin is able to delete any comment.
 
 ## Deploy Your Local Project
 

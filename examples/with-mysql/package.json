@@ -1,29 +1,32 @@
 {
+  "type": "module",
   "private": true,
   "scripts": {
-    "dev": "next",
+    "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "migrate": "node scripts/migrate-db.js"
+    "lint": "next lint"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
-    "bad-words": "^3.0.4",
-    "clsx": "^1.1.1",
-    "dotenv": "^8.2.0",
+    "@prisma/adapter-planetscale": "latest",
+    "@prisma/client": "latest",
     "next": "latest",
-    "react": "^17.0.2",
-    "react-dom": "^17.0.2",
-    "react-loading-skeleton": "^2.1.1",
-    "serverless-mysql": "^1.5.4",
-    "swr": "^0.3.9"
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "undici": "^7"
   },
   "devDependencies": {
-    "@types/node": "^14.14.6",
-    "@types/react": "^16.9.55",
-    "postcss-flexbugs-fixes": "4.2.1",
-    "postcss-preset-env": "^6.7.0",
-    "tailwindcss": "^1.7.4",
-    "typescript": "^4.0.5"
-  },
-  "license": "MIT"
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "dotenv": "^16",
+    "prisma": "latest",
+    "tailwindcss": "^4",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
 }

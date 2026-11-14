@@ -14,6 +14,8 @@ or
 yarn add @next/bundle-analyzer
 ```
 
+Note: if installing as a `devDependency` make sure to wrap the require in a `process.env` check as `next.config.js` is loaded during `next start` as well.
+
 ### Usage with environment variables
 
 Create a next.config.js (and make sure you have next-bundle-analyzer set up)
@@ -40,7 +42,19 @@ Then you can run the command below:
 ANALYZE=true yarn build
 ```
 
-When enabled two HTML files (client.html and server.html) will be outputted to `<distDir>/analyze/`. One will be for the server bundle, one for the browser bundle.
+When enabled three HTML files (client.html, edge.html and nodejs.html) will be outputted to `<distDir>/analyze/`. One will be for the nodejs server bundle, one for the edge server bundle, and one for the browser bundle.
+
+#### Options
+
+To disable automatically opening the report in your default browser, set `openAnalyzer` to false:
+
+```js
+const withBundleAnalyzer = require('@next/bundle-analyzer')({
+  enabled: process.env.ANALYZE === 'true',
+  openAnalyzer: false,
+})
+module.exports = withBundleAnalyzer({})
+```
 
 ### Usage with next-compose-plugins
 

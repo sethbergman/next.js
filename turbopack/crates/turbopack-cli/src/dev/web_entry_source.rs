@@ -1,0 +1,243 @@
+use anyhow::{Result, bail};
+use turbo_rcstr::{RcStr, rcstr};
+use turbo_tasks::{ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, Vc};
+use turbo_tasks_env::ProcessEnv;
+use turbo_tasks_fs::FileSystemPath;
+use turbopack_browser::{BrowserChunkingContext, react_refresh::assert_can_resolve_react_refresh};
+use turbopack_cli_utils::runtime_entry::{RuntimeEntries, RuntimeEntry};
+use turbopack_core::{
+    chunk::{ChunkableModule, ChunkingContext, EvaluatableAsset, SourceMapSourceType},
+    context::AssetContext,
+    environment::Environment,
+    file_source::FileSource,
+    module::Module,
+    module_graph::{
+        GraphEntries, ModuleGraph, ModuleGraphOptions, SingleModuleGraph,
+        chunk_group_info::{ChunkGroupEntry, EntryHeuristics},
+    },
+    reference_type::{EntryReferenceSubType, ReferenceType},
+    resolve::{
+        origin::{PlainResolveOrigin, ResolveOrigin},
+        parse::Request,
+    },
+    source_map::SourceMapType,
+};
+use turbopack_dev_server::{
+    html::{DevHtmlAsset, DevHtmlEntry},
+    source::{ContentSource, asset_graph::AssetGraphContentSource},
+};
+use turbopack_ecmascript_runtime::RuntimeType;
+use turbopack_node::execution_context::ExecutionContext;
+
+use crate::{
+    contexts::{
+        NodeEnv, get_client_asset_context, get_client_compile_time_info,
+        get_client_resolve_options_context,
+    },
+    embed_js::embed_file_path,
+};
+
+#[turbo_tasks::function]
+pub async fn get_client_chunking_context(
+    root_path: FileSystemPath,
+    server_root: FileSystemPath,
+    server_root_to_root_path: RcStr,
+    environment: ResolvedVc<Environment>,
+) -> Result<Vc<Box<dyn ChunkingContext>>> {
+    Ok(Vc::upcast(
+        BrowserChunkingContext::builder(
+            root_path,
+            server_root.clone(),
+            server_root_to_root_path,
+            server_root.clone(),
+            server_root.join("/_chunks")?,
+            server_root.join("/_assets")?,
+            environment,
+            RuntimeType::Development,
+        )
+        .hot_module_replacement()
+        .source_map_source_type(SourceMapSourceType::AbsoluteFileUri)
+        .dynamic_chunk_content_loading(true)
+        .nested_async_availability(true)
+        .build(),
+    ))
+}
+
+#[turbo_tasks::function]
+pub async fn get_client_runtime_entries(
+    project_path: FileSystemPath,
+    node_env: Vc<NodeEnv>,
+) -> Result<Vc<RuntimeEntries>> {
+    let resolve_options_context =
+        get_client_resolve_options_context(project_path.clone(), node_env);
+
+    let mut runtime_entries = Vec::new();
+
+    let enable_react_refresh =
+        assert_can_resolve_react_refresh(project_path.clone(), resolve_options_context)
+            .await?
+            .as_request();
+    // It's important that React Refresh come before the regular bootstrap file,
+    // because the bootstrap contains JSX which requires Refresh's global
+    // functions to be available.
+    if let Some(request) = enable_react_refresh {
+        runtime_entries.push(
+            RuntimeEntry::Request(request.to_resolved().await?, project_path.join("_")?)
+                .resolved_cell(),
+        )
+    };
+
+    runtime_entries.push(
+        RuntimeEntry::Source(ResolvedVc::upcast(
+            FileSource::new(
+                embed_file_path(rcstr!("entry/bootstrap.ts"))
+                    .owned()
+                    .await?,
+            )
+            .to_resolved()
+            .await?,
+        ))
+        .resolved_cell(),
+    );
+
+    Ok(Vc::cell(runtime_entries))
+}
+
+#[turbo_tasks::function]
+pub async fn create_web_entry_source(
+    root_path: FileSystemPath,
+    execution_context: Vc<ExecutionContext>,
+    entry_requests: Vec<Vc<Request>>,
+    server_root: FileSystemPath,
+    server_root_to_root_path: RcStr,
+    _env: Vc<Box<dyn ProcessEnv>>,
+    eager_compile: bool,
+    node_env: Vc<NodeEnv>,
+    source_maps_type: Option<SourceMapType>,
+    browserslist_query: RcStr,
+) -> Result<Vc<Box<dyn ContentSource>>> {
+    let compile_time_info = get_client_compile_time_info(browserslist_query, node_env, true);
+    let asset_context = get_client_asset_context(
+        root_path.clone(),
+        execution_context,
+        compile_time_info,
+        node_env,
+        source_maps_type,
+    );
+    let chunking_context = get_client_chunking_context(
+        root_path.clone(),
+        server_root.clone(),
+        server_root_to_root_path,
+        compile_time_info.environment(),
+    )
+    .to_resolved()
+    .await?;
+    let entries = get_client_runtime_entries(root_path.clone(), node_env);
+
+    let runtime_entries = entries.resolve_entries(asset_context);
+
+    let origin = PlainResolveOrigin::new(asset_context, root_path.join("_")?).await?;
+    let resolve_options = origin.resolve_options();
+    let asset_context = origin.asset_context();
+    let origin_path = origin.origin_path();
+    let entries = entry_requests
+        .into_iter()
+        .map(|request| {
+            let origin_path = origin_path.clone();
+            async move {
+                let ty = ReferenceType::Entry(EntryReferenceSubType::default());
+                asset_context
+                    .resolve_asset(origin_path, request, resolve_options, ty)
+                    .await?
+                    .first_module()
+                    .await
+            }
+        })
+        .try_flat_join()
+        .await?;
+
+    // The chunk groups registered here have to be exactly the ones `DevHtmlAsset` chunks later:
+    // a chunk group is identified by its entries, in order, so a different order or a repeated
+    // module is a different chunk group that `ChunkGroupInfo` wouldn't know.
+    let runtime_entry_modules = runtime_entries
+        .await?
+        .iter()
+        .map(|&entry| ResolvedVc::upcast::<Box<dyn Module>>(entry))
+        .collect::<Vec<_>>();
+    let chunk_group_entries = entries
+        .iter()
+        .map(|&module| {
+            let modules = if ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(module).is_some()
+            {
+                // `DevHtmlAsset` appends the entry to the runtime entries and evaluates all of
+                // them.
+                runtime_entry_modules
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(module))
+                    .collect()
+            } else {
+                // A module that isn't evaluatable is chunked on its own, without the runtime.
+                vec![module]
+            };
+            ChunkGroupEntry::Entry {
+                modules,
+                heuristics: EntryHeuristics::default(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let module_graph = ModuleGraph::from_graphs(
+        vec![SingleModuleGraph::new_with_entries(
+            GraphEntries::from_chunk_groups(chunk_group_entries).resolved_cell(),
+            ModuleGraphOptions::default(),
+        )],
+        None,
+    );
+    let module_graph = module_graph.connect().to_resolved().await?;
+
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(async |module| {
+            if let (Some(chunkable_module), Some(_)) = (
+                ResolvedVc::try_sidecast::<Box<dyn ChunkableModule>>(module),
+                ResolvedVc::try_sidecast::<Box<dyn EvaluatableAsset>>(module),
+            ) {
+                Ok(DevHtmlEntry {
+                    chunkable_module,
+                    module_graph,
+                    chunking_context,
+                    // Not `with_entry(module)`: `DevHtmlAsset` appends the entry itself, and
+                    // appending it here too would chunk it twice.
+                    runtime_entries: Some(runtime_entries.to_resolved().await?),
+                })
+            } else if let Some(chunkable_module) =
+                ResolvedVc::try_sidecast::<Box<dyn ChunkableModule>>(module)
+            {
+                // TODO this is missing runtime code, so it's probably broken and we should also
+                // add an ecmascript chunk with the runtime code
+                Ok(DevHtmlEntry {
+                    chunkable_module,
+                    module_graph,
+                    chunking_context,
+                    runtime_entries: None,
+                })
+            } else {
+                // TODO convert into a serve-able asset
+                bail!(
+                    "Entry module is not chunkable, so it can't be used to bootstrap the \
+                     application"
+                )
+            }
+        })
+        .try_join()
+        .await?;
+
+    let entry_asset = Vc::upcast(DevHtmlAsset::new(server_root.join("index.html")?, entries));
+
+    let graph = Vc::upcast(if eager_compile {
+        AssetGraphContentSource::new_eager(server_root, entry_asset)
+    } else {
+        AssetGraphContentSource::new_lazy(server_root, entry_asset)
+    });
+    Ok(graph)
+}

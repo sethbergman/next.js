@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "internal-pkg": "file:./internal-pkg.tgz"
+  }
+}

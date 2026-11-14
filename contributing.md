@@ -1,183 +1,53 @@
 # Contributing to Next.js
 
-Read about our [Commitment to Open Source](https://vercel.com/oss).
+- Read about our [Commitment to Open Source](https://vercel.com/oss).
+- Before jumping into a PR be sure to search [existing PRs](https://github.com/vercel/next.js/pulls) or [issues](https://github.com/vercel/next.js/issues) for an open or closed item that relates to your submission.
 
-1. [Fork](https://help.github.com/articles/fork-a-repo/) this repository to your own GitHub account and then [clone](https://help.github.com/articles/cloning-a-repository/) it to your local device.
-2. Create a new branch: `git checkout -b MY_BRANCH_NAME`
-3. Install yarn: `npm install -g yarn`
-4. Install the dependencies: `yarn`
-5. Run `yarn dev` to build and watch for code changes
-6. In a new terminal, run `yarn types` to compile declaration files from TypeScript
-7. The development branch is `canary` (this is the branch pull requests should be made against). On a release, the relevant parts of the changes in the `canary` branch are rebased into `master`.
+## What to contribute
 
-> You may need to run `yarn types` again if your types get outdated.
+Start with the issue tracker; the [`good first issue`](https://github.com/vercel/next.js/labels/good%20first%20issue) or [Documentation](https://github.com/vercel/next.js/labels/Documentation) labels are a good entry point, but any [open issue](https://github.com/vercel/next.js/issues) works.
 
-To contribute to [our examples](examples), take a look at the [“Adding examples” section](#adding-examples).
+You do not need permission to work on an issue. For new **features**, open a [discussion](https://github.com/vercel/next.js/discussions/new?category=ideas) and get the proposal accepted first.
 
-## Adding warning/error descriptions
+## Trivial changes
 
-In Next.js we have a system to add helpful links to warnings and errors.
+Every pull request has to be reviewed by a maintainer. Automation helps, but it does not eliminate that: someone still has to read the change and decide it is correct. Reviewer attention is the scarcest resource the project has. Trivial PRs such as typo fixes, formatting, or code style changes are likely to be closed. For the Next.js documentation (under `docs/`) we are more open to such changes; see the [Docs Contribution Guide](https://nextjs.org/docs/community/contribution-guide) for more information.
 
-This allows for the logged message to be short while giving a broader description and instructions on how to solve the warning/error.
+## Walkthrough video
 
-In general all warnings and errors added should have these links attached.
+[Watch a walkthrough video on how to contribute to Next.js.](https://www.youtube.com/watch?v=cuoNzXFLitc)
 
-Below are the steps to add a new link:
+## Signed commits
 
-- Create a new markdown file under the `errors` directory based on `errors/template.md`: `cp errors/template.md errors/<error-file-name>.md`
-- Add the newly added file to `errors/manifest.json`
-- Add the following url to your warning/error: `https://nextjs.org/docs/messages/<file-path-without-dotmd>`. For example to link to `errors/api-routes-static-export.md` you use the url: `https://nextjs.org/docs/messages/api-routes-static-export`
+This repository requires verified commit signatures on protected branches.
 
-## To run tests
+Before contributing, configure Git to sign your commits with a GitHub-verified GPG, SSH, or S/MIME key. Unsigned commits will be rejected by the repository rules and will need to be rewritten as signed commits before they can be merged.
 
-Make sure you have `chromedriver` installed for your Chrome version. You can install it with
+If a pull request includes unsigned commits, re-sign the commits and force-push the branch. Make sure the signing key is added to your GitHub account and that your commits appear as `Verified`.
 
-- `brew install --cask chromedriver` on Mac OS X
-- `chocolatey install chromedriver` on Windows
-- Or manually download the version that matches your installed chrome version (if there's no match, download a version under it, but not above) from the [chromedriver repo](https://chromedriver.storage.googleapis.com/index.html) and add the binary to `<next-repo>/node_modules/.bin`
+A `Signed-off-by` line in the commit message is not enough to satisfy this requirement.
 
-Running all tests:
+## Repository
 
-```sh
-yarn testonly
-```
+- [Triaging](./contributing/repository/triaging.md)
+- [Linting](./contributing/repository/linting.md)
+- [Release Channels and Publishing](./contributing/repository/release-channels-publishing.md)
+- [Pull Request Descriptions](./contributing/repository/pull-request-descriptions.md)
 
-If you would like to run the tests in headless mode (with the browser windows hidden) you can do
+## Documentation
 
-```sh
-yarn testheadless
-```
+- [Adding Documentation](./contributing/docs/adding-documentation.md)
 
-If you would like to use a specific Chrome/Chromium binary to run tests you can specify it with
+## Core
 
-```sh
-CHROME_BIN='path/to/chrome/bin' yarn testonly
-```
+- [Developing](./contributing/core/developing.md)
+- [Building](./contributing/core/building.md)
+- [Testing](./contributing/core/testing.md)
+- [Adding Error Links](./contributing/core/adding-error-links.md)
+- [Adding a new feature](./contributing/core/adding-features.md)
+- [Developing Using Local App](./contributing/core/developing-using-local-app.md)
+<!-- - [Using the VS Code Debugger](./contributing/core/vscode-debugger.md) -->
 
-Running a specific test suite inside of the `test/integration` directory:
+## Turbopack
 
-```sh
-yarn testonly --testPathPattern "production"
-```
-
-Running one test in the `production` test suite:
-
-```sh
-yarn testonly --testPathPattern "production" -t "should allow etag header support"
-```
-
-## Running the integration apps
-
-Running examples can be done with:
-
-```sh
-yarn next ./test/integration/basic
-# OR
-yarn next ./examples/basic-css/
-```
-
-To figure out which pages are available for the given example, you can run:
-
-```sh
-EXAMPLE=./test/integration/basic
-(\
-  cd $EXAMPLE/pages; \
-  find . -type f \
-  | grep -v '\.next' \
-  | sed 's#^\.##' \
-  | sed 's#index\.js##' \
-  | sed 's#\.js$##' \
-  | xargs -I{} echo localhost:3000{} \
-)
-```
-
-## Running your own app with locally compiled version of Next.js
-
-1. Move your app inside of the Next.js monorepo.
-
-2. Run with `yarn next-with-deps ./app-path-in-monorepo`
-
-This will use the version of `next` built inside of the Next.js monorepo and the main `yarn dev` monorepo command can be running to make changes to the local Next.js version at the same time (some changes might require re-running `yarn next-with-deps` to take affect).
-
-or
-
-1. In your app's `package.json`, replace:
-
-   ```json
-   "next": "<next-version>",
-   ```
-
-   with:
-
-   ```json
-   "next": "file:<local-path-to-cloned-nextjs-repo>/packages/next",
-   ```
-
-2. In your app's root directory, make sure to remove `next` from `node_modules` with:
-
-   ```sh
-   rm -rf ./node_modules/next
-   ```
-
-3. In your app's root directory, run:
-
-   ```sh
-   yarn
-   ```
-
-   to re-install all of the dependencies.
-
-   Note that Next will be copied from the locally compiled version as opposed to from being downloaded from the NPM registry.
-
-4. Run your application as you normally would.
-
-5. To update your app's dependencies, after you've made changes to your local `next` repository. In your app's root directory, run:
-
-   ```sh
-   yarn install --force
-   ```
-
-## Adding examples
-
-When you add an example to the [examples](examples) directory, don’t forget to add a `README.md` file with the following format:
-
-- Replace `DIRECTORY_NAME` with the directory name you’re adding.
-- Fill in `Example Name` and `Description`.
-- To add additional installation instructions, please add it where appropriate.
-- To add additional notes, add `## Notes` section at the end.
-- Remove the `Deploy your own` section if your example can’t be immediately deployed to Vercel.
-- Remove the `Preview` section if the example doesn't work on [StackBlitz](http://stackblitz.com/) and file an issue [here](https://github.com/stackblitz/webcontainer-core).
-
-````markdown
-# Example Name
-
-Description
-
-## Preview
-
-Preview the example live on [StackBlitz](http://stackblitz.com/):
-
-[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/vercel/next.js/tree/canary/examples/DIRECTORY_NAME)
-
-## Deploy your own
-
-Deploy the example using [Vercel](https://vercel.com?utm_source=github&utm_medium=readme&utm_campaign=next-example):
-
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/git/external?repository-url=https://github.com/vercel/next.js/tree/canary/examples/DIRECTORY_NAME&project-name=DIRECTORY_NAME&repository-name=DIRECTORY_NAME)
-
-## How to use
-
-Execute [`create-next-app`](https://github.com/vercel/next.js/tree/canary/packages/create-next-app) with [npm](https://docs.npmjs.com/cli/init) or [Yarn](https://yarnpkg.com/lang/en/docs/cli/create/) to bootstrap the example:
-
-```bash
-npx create-next-app --example DIRECTORY_NAME DIRECTORY_NAME-app
-# or
-yarn create next-app --example DIRECTORY_NAME DIRECTORY_NAME-app
-```
-
-Deploy it to the cloud with [Vercel](https://vercel.com/new?utm_source=github&utm_medium=readme&utm_campaign=next-example) ([Documentation](https://nextjs.org/docs/deployment)).
-````
-
-## Publishing
-
-Repository maintainers can use `yarn publish-canary` to publish a new version of all packages to npm.
+- [Tracing](./contributing/turbopack/tracing.md)

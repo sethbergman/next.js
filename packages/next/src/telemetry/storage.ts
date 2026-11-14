@@ -1,0 +1,386 @@
+import type { BinaryLike } from 'crypto'
+import { bold, cyan, magenta } from '../lib/picocolors'
+import Conf from 'next/dist/compiled/conf'
+import { createHash, randomBytes } from 'crypto'
+import isDockerFunction from 'next/dist/compiled/is-docker'
+import path from 'path'
+
+import { getAnonymousMeta } from './anonymous-meta'
+import * as ciEnvironment from '../server/ci-info'
+import { postNextTelemetryPayload } from './post-telemetry-payload'
+import { getRawProjectId } from './project-id'
+import fs from 'fs'
+
+// This is the key that stores whether or not telemetry is enabled or disabled.
+const TELEMETRY_KEY_ENABLED = 'telemetry.enabled'
+
+// This is the key that specifies when the user was informed about anonymous
+// telemetry collection.
+const TELEMETRY_KEY_NOTIFY_DATE = 'telemetry.notifiedAt'
+
+// This is a quasi-persistent identifier used to dedupe recurring events. It's
+// generated from random data and completely anonymous.
+const TELEMETRY_KEY_ID = `telemetry.anonymousId`
+
+// This is the cryptographic salt that is included within every hashed value.
+// This salt value is never sent to us, ensuring privacy and the one-way nature
+// of the hash (prevents dictionary lookups of pre-computed hashes).
+// See the `oneWayHash` function.
+const TELEMETRY_KEY_SALT = `telemetry.salt`
+
+export type TelemetryEvent = { eventName: string; payload: object }
+
+type RecordObject = {
+  isFulfilled: boolean
+  isRejected: boolean
+  value?: any
+  reason?: any
+}
+
+function getStorageDirectory(distDir: string): string | undefined {
+  const isLikelyEphemeral = ciEnvironment.isCI || isDockerFunction()
+
+  if (isLikelyEphemeral) {
+    return path.join(distDir, 'cache')
+  }
+
+  return undefined
+}
+
+function createConf(cwd?: string): Conf<any> | null {
+  try {
+    // Conf can throw permission errors during initialization.
+    return new Conf({ projectName: 'nextjs', cwd })
+  } catch {
+    return null
+  }
+}
+
+export class Telemetry {
+  readonly sessionId: string
+
+  private conf: Conf<any> | null
+  private preferencesConf: Conf<any> | null
+  private distDir: string
+  private loadProjectId: undefined | string | Promise<string>
+  private NEXT_TELEMETRY_DISABLED: any
+  private NEXT_TELEMETRY_DEBUG: any
+
+  private queue: Set<Promise<RecordObject>>
+
+  constructor({
+    distDir,
+    skipNotify = false,
+  }: {
+    distDir: string
+    skipNotify?: boolean
+  }) {
+    // Read in the constructor so that .env can be loaded before reading
+    const { NEXT_TELEMETRY_DISABLED, NEXT_TELEMETRY_DEBUG } = process.env
+    this.NEXT_TELEMETRY_DISABLED = NEXT_TELEMETRY_DISABLED
+    this.NEXT_TELEMETRY_DEBUG = NEXT_TELEMETRY_DEBUG
+    this.distDir = distDir
+    const storageDirectory = getStorageDirectory(distDir)
+
+    this.conf = createConf(storageDirectory)
+    // The CLI, dev server, and build can use different cache directories.
+    // Read the preference from the CLI's working-directory cache while keeping
+    // ephemeral identifiers in their existing caches.
+    const preferencesDirectory =
+      storageDirectory === undefined
+        ? undefined
+        : path.join(process.cwd(), 'cache')
+    this.preferencesConf =
+      storageDirectory === preferencesDirectory
+        ? this.conf
+        : createConf(preferencesDirectory)
+    this.sessionId = randomBytes(32).toString('hex')
+    this.queue = new Set()
+
+    if (!skipNotify) {
+      this.notify()
+    }
+  }
+
+  private notify = () => {
+    if (this.isDisabled || !this.conf) {
+      return
+    }
+
+    // The end-user has already been notified about our telemetry integration. We
+    // don't need to constantly annoy them about it.
+    // We will re-inform users about the telemetry if significant changes are
+    // ever made.
+    if (this.conf.get(TELEMETRY_KEY_NOTIFY_DATE, '')) {
+      return
+    }
+    this.conf.set(TELEMETRY_KEY_NOTIFY_DATE, Date.now().toString())
+
+    console.log(
+      `${magenta(
+        bold('Attention')
+      )}: Next.js now collects completely anonymous telemetry regarding usage.`
+    )
+    console.log(
+      `This information is used to shape Next.js' roadmap and prioritize features.`
+    )
+    console.log(
+      `You can learn more, including how to opt-out if you'd not like to participate in this anonymous program, by visiting the following URL:`
+    )
+    console.log(cyan('https://nextjs.org/telemetry'))
+    console.log()
+  }
+
+  get anonymousId(): string {
+    const val = this.conf && this.conf.get(TELEMETRY_KEY_ID)
+    if (val) {
+      return val
+    }
+
+    const generated = randomBytes(32).toString('hex')
+    this.conf && this.conf.set(TELEMETRY_KEY_ID, generated)
+    return generated
+  }
+
+  get salt(): string {
+    const val = this.conf && this.conf.get(TELEMETRY_KEY_SALT)
+    if (val) {
+      return val
+    }
+
+    const generated = randomBytes(16).toString('hex')
+    this.conf && this.conf.set(TELEMETRY_KEY_SALT, generated)
+    return generated
+  }
+
+  private get isDisabled(): boolean {
+    if (!!this.NEXT_TELEMETRY_DISABLED || !this.conf || !this.preferencesConf) {
+      return true
+    }
+    return (
+      this.preferencesConf.get(TELEMETRY_KEY_ENABLED, true) === false ||
+      (this.preferencesConf !== this.conf &&
+        this.conf.get(TELEMETRY_KEY_ENABLED, true) === false)
+    )
+  }
+
+  setEnabled = (_enabled: boolean) => {
+    const enabled = !!_enabled
+    this.preferencesConf?.set(TELEMETRY_KEY_ENABLED, enabled)
+    if (this.conf !== this.preferencesConf) {
+      this.conf?.set(TELEMETRY_KEY_ENABLED, enabled)
+    }
+    return this.preferencesConf?.path ?? this.conf?.path ?? null
+  }
+
+  get isEnabled(): boolean {
+    return !this.isDisabled
+  }
+
+  oneWayHash = (payload: BinaryLike): string => {
+    const hash = createHash('sha256')
+
+    // Always prepend the payload value with salt. This ensures the hash is truly
+    // one-way.
+    hash.update(this.salt)
+
+    // Update is an append operation, not a replacement. The salt from the prior
+    // update is still present!
+    hash.update(payload)
+    return hash.digest('hex')
+  }
+
+  private async getProjectId(): Promise<string> {
+    this.loadProjectId = this.loadProjectId || getRawProjectId()
+    return this.oneWayHash(await this.loadProjectId)
+  }
+
+  record = (
+    _events: TelemetryEvent | TelemetryEvent[],
+    deferred?: boolean
+  ): Promise<RecordObject> => {
+    const prom = (
+      deferred
+        ? // if we know we are going to immediately call
+          // flushDetached we can skip starting the initial
+          // submitRecord which will then be cancelled
+          new Promise((resolve) =>
+            resolve({
+              isFulfilled: true,
+              isRejected: false,
+              value: _events,
+            })
+          )
+        : this.submitRecord(_events)
+    )
+      .then((value) => ({
+        isFulfilled: true,
+        isRejected: false,
+        value,
+      }))
+      .catch((reason) => ({
+        isFulfilled: false,
+        isRejected: true,
+        reason,
+      }))
+      // Acts as `Promise#finally` because `catch` transforms the error
+      .then((res) => {
+        // Clean up the event to prevent unbounded `Set` growth
+        if (!deferred) {
+          this.queue.delete(prom)
+        }
+        return res
+      })
+
+    ;(prom as any)._events = Array.isArray(_events) ? _events : [_events]
+    ;(prom as any)._controller = (prom as any)._controller
+    // Track this `Promise` so we can flush pending events
+    this.queue.add(prom)
+
+    return prom
+  }
+
+  flush = async () => {
+    return Promise.all(this.queue).catch(() => null)
+  }
+
+  // writes current events to disk and spawns separate
+  // detached process to submit the records without blocking
+  // the main process from exiting
+  flushDetached = ({
+    mode,
+    dir,
+    events,
+  }: {
+    mode: 'dev'
+    dir: string
+    events: TelemetryEvent[] | null
+  }) => {
+    if (!this.isEnabled) {
+      return
+    }
+
+    // Nudges detach only their own events; shutdown flushes the full queue.
+    const allEvents: TelemetryEvent[] = events ?? []
+
+    if (events === null) {
+      this.queue.forEach((item: any) => {
+        try {
+          item._controller?.abort()
+          allEvents.push(...item._events)
+        } catch (_) {
+          // if we fail to abort ignore this event
+        }
+      })
+    }
+
+    if (allEvents.length === 0) {
+      // No events to flush
+      return
+    }
+
+    // Builds preserve cache while cleaning distDir, so detached batches survive cleanup.
+    const eventsDirectory = path.join(this.distDir, 'cache')
+    fs.mkdirSync(eventsDirectory, { recursive: true })
+    // Each flush owns its file so a later shutdown flush cannot replace a nudge batch.
+    const eventsFile = `_events_${process.pid}_${randomBytes(8).toString('hex')}.json`
+    fs.writeFileSync(
+      path.join(eventsDirectory, eventsFile),
+      JSON.stringify(allEvents)
+    )
+
+    // Note: cross-spawn is not used here as it causes
+    // a new command window to appear when we don't want it to
+    const child_process =
+      require('child_process') as typeof import('child_process')
+
+    // we use spawnSync when debugging to ensure logs are piped
+    // correctly to stdout/stderr
+    const spawn = this.NEXT_TELEMETRY_DEBUG
+      ? child_process.spawnSync
+      : child_process.spawn
+
+    spawn(
+      process.execPath,
+      [
+        require.resolve('./detached-flush'),
+        mode,
+        dir,
+        eventsFile,
+        // Use the same directory as the batch file, without reloading user config.
+        this.distDir,
+      ],
+      {
+        detached: !this.NEXT_TELEMETRY_DEBUG,
+        windowsHide: true,
+        shell: false,
+        ...(this.NEXT_TELEMETRY_DEBUG
+          ? {
+              stdio: 'inherit',
+            }
+          : {}),
+      }
+    )
+  }
+
+  private submitRecord = async (
+    _events: TelemetryEvent | TelemetryEvent[]
+  ): Promise<any> => {
+    let events: TelemetryEvent[]
+    if (Array.isArray(_events)) {
+      events = _events
+    } else {
+      events = [_events]
+    }
+
+    if (events.length < 1) {
+      return Promise.resolve()
+    }
+
+    if (this.NEXT_TELEMETRY_DEBUG) {
+      // Resolve the anonymous meta so the debug output mirrors the payload that
+      // would be sent (including `agentName`, `ciName`, etc.).
+      const meta = await getAnonymousMeta()
+      // Return a promise that resolves after logging to ensure the output
+      // is captured before the process exits (e.g., during flushDetached)
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          // Print to standard error to simplify selecting the output
+          events.forEach(({ eventName, payload }) =>
+            console.error(
+              `[telemetry] ` +
+                JSON.stringify({ eventName, payload, meta }, null, 2)
+            )
+          )
+          resolve(undefined)
+        }, 100)
+      })
+    }
+
+    // Skip recording telemetry if the feature is disabled
+    if (this.isDisabled) {
+      return Promise.resolve()
+    }
+
+    const postController = new AbortController()
+    const res = postNextTelemetryPayload(
+      {
+        context: {
+          anonymousId: this.anonymousId,
+          projectId: await this.getProjectId(),
+          sessionId: this.sessionId,
+        },
+        meta: await getAnonymousMeta(),
+        events: events.map(({ eventName, payload }) => ({
+          eventName,
+          fields: payload,
+        })),
+      },
+      postController.signal
+    )
+    // Bound delivery even when callers await record/flush; retries share this deadline.
+    const timeout = setTimeout(() => postController.abort(), 5000)
+    res._controller = postController
+    return res.finally(() => clearTimeout(timeout))
+  }
+}

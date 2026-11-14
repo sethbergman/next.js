@@ -28,7 +28,6 @@ const Form = ({ errorMessage, onSubmit }) => (
       }
       .submit {
         display: flex;
-        justify-content: flex-end;
         align-items: center;
         justify-content: space-between;
       }
@@ -51,6 +50,6 @@ const Form = ({ errorMessage, onSubmit }) => (
       }
     `}</style>
   </form>
-)
+);
 
-export default Form
+export default Form;

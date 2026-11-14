@@ -1,0 +1,35 @@
+[package]
+name = "auto-hash-map"
+version = "0.1.0"
+description = "TBD"
+license = "MIT"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+arrayvec = { workspace = true }
+bincode = { workspace = true }
+hashbrown = { workspace = true, features = ["raw-entry", "serde"]}
+indexmap = { workspace = true }
+rustc-hash = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+shrink-to-fit = { workspace = true, features = ["hashbrown"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+serde_json = { workspace = true }
+turbo-tasks-malloc = { workspace = true }
+
+[[bench]]
+name = "tiny_vec"
+harness = false
+
+[[bench]]
+name = "auto_set"
+harness = false
+
+[[bench]]
+name = "edge_set"
+harness = false

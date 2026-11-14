@@ -1,0 +1,761 @@
+use std::fmt::Write;
+
+use anyhow::Result;
+use either::Either;
+use indoc::formatdoc;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Serialize;
+use tracing::Instrument;
+use turbo_rcstr::{RcStr, rcstr};
+use turbo_tasks::{
+    FxIndexMap, FxIndexSet, ResolvedVc, TryFlatJoinIterExt, TryJoinIterExt, ValueToString,
+    ValueToStringRef, Vc,
+};
+use turbo_tasks_fs::{File, FileContent, FileSystemPath};
+use turbopack_core::{
+    asset::{Asset, AssetContent},
+    chunk::{
+        ChunkingContext, CrossOrigin, ModuleChunkItemIdExt, ModuleId as TurbopackModuleId,
+        OutputChunk,
+    },
+    module_graph::async_module_info::AsyncModulesInfo,
+    output::{OutputAsset, OutputAssets, OutputAssetsReference, OutputAssetsWithReferenced},
+};
+use turbopack_ecmascript::utils::StringifyJs;
+
+use crate::{
+    mode::NextMode,
+    next_app::ClientReferencesChunks,
+    next_client_reference::{
+        ClientReferenceGraphResult, ClientReferenceType, EcmascriptClientReferenceModule,
+    },
+    next_config::NextConfig,
+    next_manifests::{
+        ModuleId,
+        chunk_tables::{
+            ChunkList, ChunkTables, ClientChunk, CssResource, EncodedChunkTables, json_string,
+        },
+        encode_uri_component::encode_uri_path,
+    },
+    util::NextRuntime,
+};
+
+/// The client reference manifest of one entry. Written as JavaScript by `Self::write_js`, with
+/// chunk lists interned in `ChunkTables`.
+#[derive(Default)]
+pub struct SerializedClientReferenceManifest {
+    pub module_loading: ModuleLoading,
+    /// Mapping of module path and export name to client module ID and required
+    /// client chunks.
+    pub client_modules: ManifestNode,
+    /// Mapping of client module ID to corresponding SSR module ID and required
+    /// SSR chunks.
+    pub ssr_module_mapping: FxIndexMap<ModuleId, ManifestNode>,
+    /// Same as `ssr_module_mapping`, but for Edge SSR.
+    pub edge_ssr_module_mapping: FxIndexMap<ModuleId, ManifestNode>,
+    /// Mapping of client module ID to corresponding RSC module ID and required
+    /// RSC chunks.
+    pub rsc_module_mapping: FxIndexMap<ModuleId, ManifestNode>,
+    /// Same as `rsc_module_mapping`, but for Edge RSC.
+    pub edge_rsc_module_mapping: FxIndexMap<ModuleId, ManifestNode>,
+    /// Mapping of server component path to required CSS client chunks.
+    pub entry_css_files: FxIndexMap<RcStr, ChunkList>,
+    /// Mapping of server component path to required JS client chunks.
+    pub entry_js_files: FxIndexMap<RcStr, ChunkList>,
+}
+
+impl SerializedClientReferenceManifest {
+    /// Writes the manifest as a JavaScript expression that refers to `chunks`' declarations.
+    fn write_js(&self, out: &mut String, chunks: &EncodedChunkTables) -> Result<()> {
+        out.push_str("{\"moduleLoading\":");
+        out.push_str(&serde_json::to_string(&self.module_loading)?);
+        out.push_str(",\"clientModules\":");
+        self.client_modules.write_js(out, chunks)?;
+        for (name, mapping) in [
+            ("ssrModuleMapping", &self.ssr_module_mapping),
+            ("edgeSSRModuleMapping", &self.edge_ssr_module_mapping),
+            ("rscModuleMapping", &self.rsc_module_mapping),
+            ("edgeRscModuleMapping", &self.edge_rsc_module_mapping),
+        ] {
+            write!(out, ",\"{name}\":{{")?;
+            for (index, (id, node)) in mapping.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                // Object keys are strings, so numeric ids are quoted, as in JSON.
+                match id {
+                    ModuleId::String(id) => out.push_str(&json_string(id)),
+                    ModuleId::Number(id) => write!(out, "\"{id}\"")?,
+                }
+                out.push(':');
+                node.write_js(out, chunks)?;
+            }
+            out.push('}');
+        }
+        for (name, lists) in [
+            ("entryCSSFiles", &self.entry_css_files),
+            ("entryJSFiles", &self.entry_js_files),
+        ] {
+            write!(out, ",\"{name}\":{{")?;
+            for (index, (name, list)) in lists.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_string(name));
+                out.push(':');
+                chunks.write(out, *list);
+            }
+            out.push('}');
+        }
+        out.push('}');
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleLoading {
+    pub prefix: RcStr,
+    #[serde(skip_serializing_if = "is_cross_origin_none")]
+    pub cross_origin: CrossOrigin,
+}
+
+fn is_cross_origin_none(cross_origin: &CrossOrigin) -> bool {
+    matches!(cross_origin, CrossOrigin::None)
+}
+
+#[derive(Default, Debug)]
+pub struct ManifestNode {
+    /// Mapping of export name to manifest node entry.
+    pub module_exports: FxIndexMap<RcStr, ManifestNodeEntry>,
+}
+
+/// Factories for [`ManifestNodeEntry`]s and for [`ManifestNode`]s whose only export is `*`.
+/// Besides being smaller than object literals, every object they build has the same shape, which
+/// V8 handles better than many literals.
+const MANIFEST_NODE_FACTORIES: &str = "const e = (id, chunks, async = false) => ({ id, name: \
+                                       \"*\", chunks, async }), n = (id, chunks, async) => ({ \
+                                       \"*\": e(id, chunks, async) });\n";
+
+impl ManifestNode {
+    fn write_js(&self, out: &mut String, chunks: &EncodedChunkTables) -> Result<()> {
+        if self.module_exports.len() == 1
+            && let Some((name, entry)) = self.module_exports.first()
+            && name == "*"
+        {
+            return entry.write_factory_call(out, "n", chunks);
+        }
+        out.push('{');
+        for (index, (name, entry)) in self.module_exports.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(name));
+            out.push(':');
+            entry.write_factory_call(out, "e", chunks)?;
+        }
+        out.push('}');
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ManifestNodeEntry {
+    /// Turbopack module ID.
+    pub id: ModuleId,
+    /// Chunks for the module. JS and CSS.
+    pub chunks: ChunkList,
+    // TODO(WEB-434)
+    pub r#async: bool,
+}
+
+impl ManifestNodeEntry {
+    /// `<factory>(id,chunks)` or `(id,chunks,true)`, for the factories in
+    /// `MANIFEST_NODE_FACTORIES`.
+    fn write_factory_call(
+        &self,
+        out: &mut String,
+        factory: &str,
+        chunks: &EncodedChunkTables,
+    ) -> Result<()> {
+        write!(out, "{factory}({},", serde_json::to_string(&self.id)?)?;
+        chunks.write(out, self.chunks);
+        out.push_str(if self.r#async { ",!0)" } else { ")" });
+        Ok(())
+    }
+}
+
+#[turbo_tasks::value(shared)]
+pub struct ClientReferenceManifest {
+    pub node_root: FileSystemPath,
+    pub client_relative_path: FileSystemPath,
+    pub entry_name: RcStr,
+    pub client_references: ResolvedVc<ClientReferenceGraphResult>,
+    pub client_references_chunks: ResolvedVc<ClientReferencesChunks>,
+    pub client_chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    pub ssr_chunking_context: Option<ResolvedVc<Box<dyn ChunkingContext>>>,
+    pub async_module_info: ResolvedVc<AsyncModulesInfo>,
+    pub next_config: ResolvedVc<NextConfig>,
+    pub runtime: NextRuntime,
+    pub mode: NextMode,
+}
+
+#[turbo_tasks::value_impl]
+impl OutputAssetsReference for ClientReferenceManifest {
+    #[turbo_tasks::function]
+    async fn references(self: Vc<Self>) -> Result<Vc<OutputAssetsWithReferenced>> {
+        Ok(OutputAssetsWithReferenced::from_assets(
+            *build_manifest(self).await?.references,
+        ))
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl OutputAsset for ClientReferenceManifest {
+    #[turbo_tasks::function]
+    async fn path(&self) -> Result<Vc<FileSystemPath>> {
+        let normalized_manifest_entry = self.entry_name.replace("%5F", "_");
+        Ok(self
+            .node_root
+            .join(&format!(
+                "server/app{normalized_manifest_entry}_client-reference-manifest.js",
+            ))?
+            .cell())
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl Asset for ClientReferenceManifest {
+    #[turbo_tasks::function]
+    async fn content(self: Vc<Self>) -> Result<Vc<AssetContent>> {
+        Ok(*build_manifest(self).await?.content)
+    }
+}
+
+#[turbo_tasks::value(shared)]
+struct ClientReferenceManifestResult {
+    content: ResolvedVc<AssetContent>,
+    references: ResolvedVc<OutputAssets>,
+}
+
+#[turbo_tasks::function]
+async fn build_manifest(
+    manifest: Vc<ClientReferenceManifest>,
+) -> Result<Vc<ClientReferenceManifestResult>> {
+    let ClientReferenceManifest {
+        node_root,
+        client_relative_path,
+        entry_name,
+        client_references,
+        client_references_chunks,
+        client_chunking_context,
+        ssr_chunking_context,
+        async_module_info,
+        next_config,
+        runtime,
+        mode,
+    } = &*manifest.await?;
+    let span = tracing::info_span!(
+        "build client reference manifest",
+        entry_name = display(&entry_name)
+    );
+    async move {
+        let mut entry_manifest: SerializedClientReferenceManifest = Default::default();
+        let mut chunk_tables = ChunkTables::default();
+        let mut references = FxIndexSet::default();
+        let prefix_path = next_config.computed_asset_prefix().owned().await?;
+        let add_deployment_id_at_runtime = *next_config
+            .should_append_server_deployment_id_at_runtime()
+            .await?;
+        // Only read the suffix (e.g. `?dpl=<id>`) when it's used, so the manifest doesn't depend
+        // on the deployment id when it's added at runtime.
+        let suffix_path = if !add_deployment_id_at_runtime {
+            next_config
+                .asset_suffix_path()
+                .owned()
+                .await?
+                .unwrap_or_default()
+        } else {
+            rcstr!("")
+        };
+
+        entry_manifest.module_loading.cross_origin = *next_config.cross_origin().await?;
+        let ClientReferencesChunks {
+            client_component_client_chunks,
+            layout_segment_client_chunks,
+            client_component_ssr_chunks,
+        } = &*client_references_chunks.await?;
+        let client_relative_path = client_relative_path.clone();
+        let node_root_ref = node_root.clone();
+
+        let client_references_ecmascript = client_references
+            .await?
+            .client_references
+            .iter()
+            .map(async |r| {
+                Ok(match r.ty {
+                    ClientReferenceType::EcmascriptClientReference(r) => Some((r, r.await?)),
+                    ClientReferenceType::CssClientReference(_) => None,
+                })
+            })
+            .try_flat_join()
+            .await?;
+
+        let async_modules = client_references_ecmascript
+            .iter()
+            .flat_map(|(r, r_val)| {
+                [
+                    ResolvedVc::upcast(*r),
+                    ResolvedVc::upcast(r_val.client_module),
+                    ResolvedVc::upcast(r_val.ssr_module),
+                ]
+            })
+            .map(async move |asset| {
+                Ok(if async_module_info.is_async(asset).await? {
+                    Some(asset)
+                } else {
+                    None
+                })
+            })
+            .try_flat_join()
+            .await?;
+
+        async fn cached_chunk_paths(
+            cache: &mut FxHashMap<ResolvedVc<Box<dyn OutputAsset>>, FileSystemPath>,
+            chunks: impl Iterator<Item = ResolvedVc<Box<dyn OutputAsset>>>,
+        ) -> Result<impl Iterator<Item = (ResolvedVc<Box<dyn OutputAsset>>, FileSystemPath)>>
+        {
+            let results = chunks
+                .into_iter()
+                .map(|chunk| (chunk, cache.get(&chunk).cloned()))
+                .map(async |(chunk, path)| {
+                    Ok(if let Some(path) = path {
+                        (chunk, Either::Left(path))
+                    } else {
+                        (chunk, Either::Right(chunk.path().owned().await?))
+                    })
+                })
+                .try_join()
+                .await?;
+
+            for (chunk, path) in &results {
+                if let Either::Right(path) = path {
+                    cache.insert(*chunk, path.clone());
+                }
+            }
+            Ok(results.into_iter().map(|(chunk, path)| match path {
+                Either::Left(path) => (chunk, path),
+                Either::Right(path) => (chunk, path),
+            }))
+        }
+        let mut client_chunk_path_cache: FxHashMap<
+            ResolvedVc<Box<dyn OutputAsset>>,
+            FileSystemPath,
+        > = FxHashMap::default();
+        let mut ssr_chunk_path_cache: FxHashMap<ResolvedVc<Box<dyn OutputAsset>>, FileSystemPath> =
+            FxHashMap::default();
+
+        let mut client_reference_chunk_paths: FxHashSet<RcStr> = FxHashSet::default();
+
+        for (client_reference_module, client_reference_module_ref) in client_references_ecmascript {
+            let app_client_reference_ty =
+                ClientReferenceType::EcmascriptClientReference(client_reference_module);
+
+            let ids = client_reference_ids(
+                *client_reference_module,
+                **client_chunking_context,
+                ssr_chunking_context.map(|chunking_context| *chunking_context),
+            )
+            .await?;
+            let server_path = &ids.server_path;
+            let client_module = client_reference_module_ref.client_module;
+            let client_chunk_item_id = &ids.client_id;
+
+            let (client_chunks_paths, client_is_async) = if let Some(client_assets) =
+                client_component_client_chunks.get(&app_client_reference_ty)
+            {
+                let client_chunks = client_assets.primary_assets().await?;
+                let client_referenced_assets = client_assets.referenced_assets().await?;
+                references.extend(client_chunks.iter());
+                references.extend(client_referenced_assets.iter());
+
+                let client_chunks_paths =
+                    cached_chunk_paths(&mut client_chunk_path_cache, client_chunks.iter().copied())
+                        .await?;
+
+                let js_chunks = client_chunks_paths
+                    .filter_map(|(chunk, chunk_path)| {
+                        client_relative_path
+                            .get_path_to(&chunk_path)
+                            .map(|path| (chunk, path.to_string()))
+                    })
+                    // It's possible that a chunk also emits CSS files, that will
+                    // be handled separately.
+                    .filter(|(_, path)| path.ends_with(".js"))
+                    .collect::<Vec<_>>();
+
+                for (_, path) in &js_chunks {
+                    client_reference_chunk_paths.insert(RcStr::from(path.as_str()));
+                }
+
+                let chunk_paths = js_chunks
+                    .into_iter()
+                    .map(async |(chunk, path)| {
+                        // Size for the common case where nothing needs escaping, so this is the
+                        // only allocation and `RcStr` can take the buffer without reallocating.
+                        let mut url = String::with_capacity(
+                            prefix_path.len() + path.len() + suffix_path.len(),
+                        );
+                        write!(url, "{prefix_path}{}{suffix_path}", encode_uri_path(&path))?;
+                        let url = RcStr::from(url);
+                        // If this is a merged chunk, emit its component chunk paths alongside the
+                        // URL so the browser runtime can split it during navigation.
+                        let components =
+                            client_chunk_components(*chunk, client_relative_path.clone())
+                                .owned()
+                                .await?;
+                        Ok(if components.is_empty() {
+                            ClientChunk::Path(url)
+                        } else {
+                            let (component_paths, component_sizes) =
+                                components.into_iter().unzip();
+                            ClientChunk::Merged {
+                                url,
+                                component_paths,
+                                component_sizes,
+                            }
+                        })
+                    })
+                    .try_join()
+                    .await?;
+
+                let is_async = async_modules.contains(&ResolvedVc::upcast(client_module));
+
+                (chunk_paths, is_async)
+            } else {
+                (Vec::new(), false)
+            };
+
+            if let (Some(ssr_chunk_item_id), Some(rsc_chunk_item_id)) = (&ids.ssr_id, &ids.rsc_id) {
+                let ssr_module = client_reference_module_ref.ssr_module;
+
+                let (ssr_chunks_paths, ssr_is_async) = if *runtime == NextRuntime::Edge {
+                    // the chunks get added to the middleware-manifest.json instead
+                    // of this file because the
+                    // edge runtime doesn't support dynamically
+                    // loading chunks.
+                    (Vec::new(), false)
+                } else if let Some(ssr_assets) =
+                    client_component_ssr_chunks.get(&app_client_reference_ty)
+                {
+                    let ssr_chunks = ssr_assets.primary_assets().await?;
+                    let ssr_referenced_assets = ssr_assets.referenced_assets().await?;
+                    references.extend(ssr_chunks.iter());
+                    references.extend(ssr_referenced_assets.iter());
+
+                    let ssr_chunks_paths =
+                        cached_chunk_paths(&mut ssr_chunk_path_cache, ssr_chunks.iter().copied())
+                            .await?;
+                    let chunk_paths = ssr_chunks_paths
+                        .filter_map(|(_, chunk_path)| {
+                            node_root_ref
+                                .get_path_to(&chunk_path)
+                                .map(ToString::to_string)
+                        })
+                        .map(RcStr::from)
+                        .collect::<Vec<_>>();
+
+                    let is_async = async_modules.contains(&ResolvedVc::upcast(ssr_module));
+
+                    (chunk_paths, is_async)
+                } else {
+                    (Vec::new(), false)
+                };
+
+                let rsc_is_async = if *runtime == NextRuntime::Edge {
+                    false
+                } else {
+                    async_modules.contains(&ResolvedVc::upcast(client_reference_module))
+                };
+
+                entry_manifest.client_modules.module_exports.insert(
+                    server_path.clone(),
+                    ManifestNodeEntry {
+                        id: client_chunk_item_id.into(),
+                        chunks: chunk_tables.chunks_urls(client_chunks_paths),
+                        // This should of course be client_is_async, but SSR can become
+                        // async due to ESM externals, and
+                        // the ssr_manifest_node is currently ignored
+                        // by React.
+                        r#async: client_is_async || ssr_is_async,
+                    },
+                );
+
+                let mut ssr_manifest_node = ManifestNode::default();
+                ssr_manifest_node.module_exports.insert(
+                    rcstr!("*"),
+                    ManifestNodeEntry {
+                        id: ssr_chunk_item_id.into(),
+                        chunks: chunk_tables.chunk_paths(ssr_chunks_paths),
+                        // See above
+                        r#async: client_is_async || ssr_is_async,
+                    },
+                );
+
+                let mut rsc_manifest_node = ManifestNode::default();
+                rsc_manifest_node.module_exports.insert(
+                    rcstr!("*"),
+                    ManifestNodeEntry {
+                        id: rsc_chunk_item_id.into(),
+                        chunks: chunk_tables.chunk_paths([]),
+                        r#async: rsc_is_async,
+                    },
+                );
+
+                match runtime {
+                    NextRuntime::NodeJs => {
+                        entry_manifest
+                            .ssr_module_mapping
+                            .insert(client_chunk_item_id.into(), ssr_manifest_node);
+                        entry_manifest
+                            .rsc_module_mapping
+                            .insert(client_chunk_item_id.into(), rsc_manifest_node);
+                    }
+                    NextRuntime::Edge => {
+                        entry_manifest
+                            .edge_ssr_module_mapping
+                            .insert(client_chunk_item_id.into(), ssr_manifest_node);
+                        entry_manifest
+                            .edge_rsc_module_mapping
+                            .insert(client_chunk_item_id.into(), rsc_manifest_node);
+                    }
+                }
+            }
+        }
+
+        // per layout segment chunks need to be emitted into the manifest too
+        let mut entry_js_files_by_component: FxIndexMap<RcStr, FxIndexSet<RcStr>> =
+            FxIndexMap::default();
+        let mut entry_css_files_by_component: FxIndexMap<RcStr, FxIndexSet<CssResource>> =
+            FxIndexMap::default();
+        for (server_component, client_assets) in layout_segment_client_chunks.iter() {
+            // Use source_path() to get the original source path (e.g., page.mdx) instead of
+            // server_path() which returns the transformed path (e.g., page.mdx.tsx).
+            // This ensures the manifest key matches what the LoaderTree stores and what
+            // the runtime looks up after stripping one extension.
+            let server_component_name = server_component
+                .source_path()
+                .await?
+                .with_extension("")
+                .to_string_ref()
+                .await?;
+            let entry_js_files = entry_js_files_by_component
+                .entry(server_component_name.clone())
+                .or_default();
+            let entry_css_files = entry_css_files_by_component
+                .entry(server_component_name)
+                .or_default();
+
+            let client_chunks = client_assets.primary_assets().await?;
+            let client_chunks_with_path =
+                cached_chunk_paths(&mut client_chunk_path_cache, client_chunks.iter().copied())
+                    .await?;
+            // Inlining breaks HMR so it is always disabled in dev.
+            let inlined_css = *next_config.inline_css().await? && mode.is_production();
+            // Component chunks are also exposed via `clientModules[].chunks`, so when the feature
+            // is on we drop them from `entryJSFiles` to avoid double-listing. When it's off the
+            // manifest must match the non-component-chunk output exactly.
+            let generate_component_chunks =
+                *next_config.turbopack_generate_component_chunks().await?;
+
+            for (chunk, chunk_path) in client_chunks_with_path {
+                if let Some(path) = client_relative_path.get_path_to(&chunk_path) {
+                    // The entry CSS files and entry JS files don't have prefix and suffix
+                    // applied because it is added by Next.js during rendering.
+                    let path = path.into();
+                    if chunk_path.has_extension(".css") {
+                        let content = if inlined_css {
+                            Some(
+                                if let Some(content_file) =
+                                    chunk.content().file_content().await?.as_content()
+                                {
+                                    content_file.content().to_str()?.into()
+                                } else {
+                                    RcStr::default()
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        entry_css_files.insert(CssResource {
+                            path,
+                            inlined: inlined_css,
+                            content,
+                        });
+                    } else if !mode.is_production()
+                        || !generate_component_chunks
+                        || !client_reference_chunk_paths.contains(&path)
+                    {
+                        entry_js_files.insert(path);
+                    }
+                }
+            }
+        }
+
+        entry_manifest.entry_css_files = entry_css_files_by_component
+            .into_iter()
+            .map(|(name, files)| (name, chunk_tables.css(files)))
+            .collect();
+        entry_manifest.entry_js_files = entry_js_files_by_component
+            .into_iter()
+            .map(|(name, files)| (name, chunk_tables.chunk_paths(files)))
+            .collect();
+
+        // The manifest repeats the same chunk lists for many client references, so a JSON
+        // encoding is typically 10-30x larger than one that shares them.
+        let chunk_tables = chunk_tables.finish();
+        let mut manifest = String::new();
+        entry_manifest.write_js(&mut manifest, &chunk_tables)?;
+        drop(entry_manifest);
+        let declarations = chunk_tables.declarations();
+
+        // We put normalized path for the each entry key and the manifest output path,
+        // to conform next.js's load client reference manifest behavior:
+        // https://github.com/vercel/next.js/blob/2f9d718695e4c90be13c3bf0f3647643533071bf/packages/next/src/server/load-components.ts#L162-L164
+        // note this only applies to the manifests, assets are placed to the original
+        // path still (same as webpack does)
+        let normalized_manifest_entry = entry_name.replace("%5F", "_");
+        Ok(ClientReferenceManifestResult {
+            content: AssetContent::file(
+                FileContent::Content(File::from(formatdoc! {
+                    r#"
+                        (() => {{
+                        {declarations}{MANIFEST_NODE_FACTORIES}(globalThis.__RSC_MANIFEST ??= {{}})[{entry_name}] = {manifest};
+                        }})();
+                        {suffix}
+                    "#,
+                    entry_name = StringifyJs(&normalized_manifest_entry),
+                    suffix = if add_deployment_id_at_runtime {
+                        formatdoc!{
+                            r#"
+                            for (const key in globalThis.__RSC_MANIFEST[{entry_name}].clientModules) {{
+                                const val = {{ ...globalThis.__RSC_MANIFEST[{entry_name}].clientModules[key] }}
+                                globalThis.__RSC_MANIFEST[{entry_name}].clientModules[key] = val
+                                val.chunks = val.chunks.map((c) =>
+                                    typeof c === 'string'
+                                        ? `${{c}}?dpl=${{process.env.NEXT_DEPLOYMENT_ID}}`
+                                        : [`${{c[0]}}?dpl=${{process.env.NEXT_DEPLOYMENT_ID}}`, c[1], c[2]])
+                            }}
+                            "#,
+                            entry_name = StringifyJs(&normalized_manifest_entry),
+                        }
+                    } else {
+                        "".to_string()
+                    }
+                }))
+                .cell(),
+            )
+            .to_resolved()
+            .await?,
+            references: ResolvedVc::cell(references.into_iter().collect()),
+        }
+        .cell())
+    }
+    .instrument(span)
+    .await
+}
+
+impl From<&TurbopackModuleId> for ModuleId {
+    fn from(module_id: &TurbopackModuleId) -> Self {
+        match module_id {
+            TurbopackModuleId::String(string) => ModuleId::String(string.clone()),
+            TurbopackModuleId::Number(number) => ModuleId::Number(*number as _),
+        }
+    }
+}
+
+/// The paths (relative to the client root) and sizes of a merged chunk's component chunks. A
+/// task, so that it runs once per chunk instead of once per page and client reference using it.
+#[turbo_tasks::value(transparent)]
+struct ClientChunkComponents(Vec<(RcStr, u64)>);
+
+#[turbo_tasks::function]
+async fn client_chunk_components(
+    chunk: ResolvedVc<Box<dyn OutputAsset>>,
+    client_relative_path: FileSystemPath,
+) -> Result<Vc<ClientChunkComponents>> {
+    let Some(output_chunk) = ResolvedVc::try_sidecast::<Box<dyn OutputChunk>>(chunk) else {
+        return Ok(Vc::cell(Vec::new()));
+    };
+    let Some(component_chunks) = output_chunk.runtime_info().await?.module_chunks else {
+        return Ok(Vc::cell(Vec::new()));
+    };
+    let component_assets = component_chunks.await?;
+    let mut components = Vec::with_capacity(component_assets.len());
+    for component in component_assets.iter() {
+        let component_path = component.path().await?;
+        if let Some(rel) = client_relative_path.get_path_to(&component_path)
+            && rel.ends_with(".js")
+        {
+            let size = component
+                .content()
+                .file_content()
+                .await?
+                .as_content()
+                .map_or(0, |file| file.content().len() as u64);
+            components.push((RcStr::from(rel), size));
+        }
+    }
+    Ok(Vc::cell(components))
+}
+
+/// The parts of a client reference's manifest entries that do not depend on the page: its
+/// server path and its module ids for the client, SSR and RSC sides. A task, so that they are
+/// computed once per client reference instead of once per page that uses it.
+#[turbo_tasks::value(shared)]
+struct ClientReferenceIds {
+    server_path: RcStr,
+    client_id: TurbopackModuleId,
+    /// Set when there is an SSR chunking context.
+    ssr_id: Option<TurbopackModuleId>,
+    /// Set when there is an SSR chunking context.
+    rsc_id: Option<TurbopackModuleId>,
+}
+
+#[turbo_tasks::function]
+async fn client_reference_ids(
+    client_reference_module: ResolvedVc<EcmascriptClientReferenceModule>,
+    client_chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+    ssr_chunking_context: Option<ResolvedVc<Box<dyn ChunkingContext>>>,
+) -> Result<Vc<ClientReferenceIds>> {
+    let module = client_reference_module.await?;
+    let server_path = module.server_ident.to_string().owned().await?;
+    let client_id = module
+        .client_module
+        .chunk_item_id(*client_chunking_context)
+        .await?;
+    let (ssr_id, rsc_id) = if let Some(ssr_chunking_context) = ssr_chunking_context {
+        (
+            Some(
+                module
+                    .ssr_module
+                    .chunk_item_id(*ssr_chunking_context)
+                    .await?,
+            ),
+            Some(
+                client_reference_module
+                    .chunk_item_id(*ssr_chunking_context)
+                    .await?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(ClientReferenceIds {
+        server_path,
+        client_id,
+        ssr_id,
+        rsc_id,
+    }
+    .cell())
+}

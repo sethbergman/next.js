@@ -1,0 +1,30 @@
+import RevalidateViaForm from './RevalidateViaForm'
+import Link from 'next/link'
+
+export default async function Page() {
+  const data = await fetch(
+    'https://next-data-api-endpoint.vercel.app/api/random',
+    {
+      next: {
+        tags: ['revalidatetag-rsc:data'],
+        revalidate: false,
+      },
+    }
+  ).then((res) => res.text())
+
+  return (
+    <div>
+      <span id="data">{data}</span>
+      <RevalidateViaForm tag="revalidatetag-rsc:data" />
+      <Link
+        href="/revalidate_via_page?tag=revalidatetag-rsc:data"
+        id="revalidate-via-page"
+      >
+        Revalidate via page
+      </Link>
+      <Link href="/revalidate_via_cache" id="revalidate-via-cache">
+        Revalidate via cache
+      </Link>
+    </div>
+  )
+}

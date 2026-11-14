@@ -1,15 +1,9 @@
-const fs = require('fs')
+const fs = require('fs/promises')
 const path = require('path')
-// this page is conditionally added when not testing
-// in webpack 4 mode since it's not supported for webpack 4
-const imagePageData = fs.readFileSync(
-  path.join(__dirname, './image.js'),
-  'utf8'
-)
 
 const clientGlobs = [
   {
-    name: 'Client Bundles (main, webpack, commons)',
+    name: 'Client Bundles (main)',
     globs: [
       '.next/static/runtime/+(main|webpack)-*',
       '.next/static/chunks/!(polyfills*)',
@@ -21,7 +15,10 @@ const clientGlobs = [
   },
   {
     name: 'Client Pages',
-    globs: ['.next/static/BUILD_ID/pages/**/*.js', '.next/static/css/**/*'],
+    globs: [
+      '.next/static/BUILD_ID/pages/!(edge-repeated*)',
+      '.next/static/css/**/*',
+    ],
   },
   {
     name: 'Client Build Manifests',
@@ -29,7 +26,60 @@ const clientGlobs = [
   },
   {
     name: 'Rendered Page Sizes',
-    globs: ['fetched-pages/**/*.html'],
+    globs: ['fetched-pages/!(edge-repeated*)'],
+  },
+  {
+    name: 'Edge SSR bundle Size',
+    globs: [
+      '.next/server/pages/edge-ssr.js',
+      '.next/server/app/app-edge-ssr/page.js',
+    ],
+    getRequiredFiles: async (nextAppDir, fileName) => {
+      if (fileName.startsWith('.next/server/app')) {
+        const manifestJson = await fs.readFile(
+          path.join(nextAppDir, '.next/server/middleware-manifest.json')
+        )
+        const manifest = JSON.parse(manifestJson)
+        const manifestFileEntry = path.relative(
+          path.join(nextAppDir, '.next'),
+          path.join(nextAppDir, fileName)
+        )
+
+        const functionEntry = Object.values(manifest.functions).find(
+          (entry) => {
+            return entry.files.includes(manifestFileEntry)
+          }
+        )
+
+        if (functionEntry === undefined) {
+          throw new Error(
+            `${manifestFileEntry} is not listed in the files files of any functions in the manifest:\n` +
+              JSON.stringify(manifest, null, 2)
+          )
+        }
+
+        return functionEntry.files.map((file) => {
+          return path.join('.next', file)
+        })
+      } else {
+        return [fileName]
+      }
+    },
+  },
+  {
+    name: 'Middleware size',
+    globs: [
+      '.next/server/middleware*.js',
+      '.next/server/edge-runtime-webpack.js',
+    ],
+  },
+  {
+    name: 'Next Runtimes',
+    globs: ['node_modules/next/dist/compiled/next-server/**/*.js'],
+  },
+  {
+    name: 'build cache',
+    globs: ['.next/cache/**/*'],
   },
 ]
 
@@ -59,8 +109,10 @@ const renames = [
 module.exports = {
   commentHeading: 'Stats from current PR',
   commentReleaseHeading: 'Stats from current release',
-  appBuildCommand: 'NEXT_TELEMETRY_DISABLED=1 yarn next build',
-  appStartCommand: 'NEXT_TELEMETRY_DISABLED=1 yarn next start --port $PORT',
+  appBuildCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next build --webpack',
+  appStartCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next start --port $PORT',
+  appDevCommand: 'NEXT_TELEMETRY_DISABLED=1 pnpm next dev --port $PORT',
+  measureDevBoot: true,
   mainRepo: 'vercel/next.js',
   mainBranch: 'canary',
   autoMergeMain: true,
@@ -70,14 +122,11 @@ module.exports = {
       diff: 'onOutputChange',
       diffConfigFiles: [
         {
-          path: 'pages/image.js',
-          content: imagePageData,
-        },
-        {
           path: 'next.config.js',
           content: `
             module.exports = {
               generateBuildId: () => 'BUILD_ID',
+              turbopack: {},
               webpack(config) {
                 config.optimization.minimize = false
                 config.optimization.minimizer = undefined
@@ -91,14 +140,11 @@ module.exports = {
       renames,
       configFiles: [
         {
-          path: 'pages/image.js',
-          content: imagePageData,
-        },
-        {
           path: 'next.config.js',
           content: `
-            module.exports = {
-              generateBuildId: () => 'BUILD_ID'
+          module.exports = {
+              generateBuildId: () => 'BUILD_ID',
+              turbopack: {},
             }
           `,
         },
@@ -110,63 +156,16 @@ module.exports = {
         'http://localhost:$PORT/link',
         'http://localhost:$PORT/withRouter',
       ],
-      pagesToBench: [
-        'http://localhost:$PORT/',
-        'http://localhost:$PORT/error-in-render',
-      ],
-      benchOptions: {
-        reqTimeout: 60,
-        concurrency: 50,
-        numRequests: 2500,
-      },
-    },
-    {
-      title: 'Webpack 4 Mode',
-      diff: 'onOutputChange',
-      diffConfigFiles: [
-        {
-          path: 'next.config.js',
-          content: `
-            module.exports = {
-              generateBuildId: () => 'BUILD_ID',
-              webpack5: false,
-              webpack(config) {
-                config.optimization.minimize = false
-                config.optimization.minimizer = undefined
-                return config
-              }
-            }
-          `,
-        },
-      ],
-      renames,
-      configFiles: [
-        {
-          path: 'next.config.js',
-          content: `
-            module.exports = {
-              generateBuildId: () => 'BUILD_ID',
-              webpack5: false
-            }
-          `,
-        },
-      ],
-      filesToTrack: clientGlobs,
-      // will be output to fetched-pages/${pathname}.html
-      pagesToFetch: [
-        'http://localhost:$PORT/',
-        'http://localhost:$PORT/link',
-        'http://localhost:$PORT/withRouter',
-      ],
-      pagesToBench: [
-        'http://localhost:$PORT/',
-        'http://localhost:$PORT/error-in-render',
-      ],
-      benchOptions: {
-        reqTimeout: 60,
-        concurrency: 50,
-        numRequests: 2500,
-      },
+      // TODO: investigate replacing "ab" for this
+      // pagesToBench: [
+      //   'http://localhost:$PORT/',
+      //   'http://localhost:$PORT/error-in-render',
+      // ],
+      // benchOptions: {
+      //   reqTimeout: 60,
+      //   concurrency: 50,
+      //   numRequests: 2500,
+      // },
     },
   ],
 }

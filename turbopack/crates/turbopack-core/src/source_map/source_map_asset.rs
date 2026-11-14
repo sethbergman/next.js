@@ -1,0 +1,149 @@
+use anyhow::{Context, Result};
+use bincode::{Decode, Encode};
+use turbo_rcstr::{RcStr, rcstr};
+use turbo_tasks::{
+    FxIndexSet, NonLocalValue, ResolvedVc, ValueToString, Vc, debug::ValueDebugFormat,
+};
+use turbo_tasks_fs::{File, FileContent, FileSystemPath};
+
+use crate::{
+    asset::{Asset, AssetContent},
+    chunk::ChunkingContext,
+    ident::AssetIdent,
+    introspect::{Introspectable, IntrospectableChildren},
+    output::{OutputAsset, OutputAssetsReference},
+    source_map::{GenerateSourceMap, SourceMap, SourceMapType},
+};
+
+#[derive(PartialEq, Eq, NonLocalValue, ValueDebugFormat, Encode, Decode)]
+enum PathType {
+    Fixed {
+        path: FileSystemPath,
+    },
+    FromIdent {
+        chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+        ident_for_path: ResolvedVc<AssetIdent>,
+        extension: RcStr,
+    },
+}
+
+/// Represents the source map of an output asset.
+#[turbo_tasks::value]
+pub struct SourceMapAsset {
+    path_ty: PathType,
+    source_map_ty: Option<SourceMapType>,
+    generate_source_map: ResolvedVc<Box<dyn GenerateSourceMap>>,
+}
+
+#[turbo_tasks::value_impl]
+impl SourceMapAsset {
+    #[turbo_tasks::function]
+    pub async fn new(
+        chunking_context: ResolvedVc<Box<dyn ChunkingContext>>,
+        ident_for_path: ResolvedVc<AssetIdent>,
+        generate_source_map: ResolvedVc<Box<dyn GenerateSourceMap>>,
+        extension: RcStr,
+    ) -> Result<Vc<Self>> {
+        Ok(SourceMapAsset {
+            path_ty: PathType::FromIdent {
+                chunking_context,
+                ident_for_path,
+                extension,
+            },
+            source_map_ty: *chunking_context.emitted_source_map_type().await?,
+            generate_source_map,
+        }
+        .cell())
+    }
+
+    #[turbo_tasks::function]
+    pub fn new_fixed(
+        path: FileSystemPath,
+        source_map_ty: SourceMapType,
+        generate_source_map: ResolvedVc<Box<dyn GenerateSourceMap>>,
+    ) -> Vc<Self> {
+        SourceMapAsset {
+            path_ty: PathType::Fixed { path },
+            source_map_ty: Some(source_map_ty),
+            generate_source_map,
+        }
+        .cell()
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl OutputAssetsReference for SourceMapAsset {}
+
+#[turbo_tasks::value_impl]
+impl OutputAsset for SourceMapAsset {
+    #[turbo_tasks::function]
+    async fn path(self: Vc<Self>) -> Result<Vc<FileSystemPath>> {
+        // NOTE(alexkirsz) We used to include the asset's version id in the path,
+        // but this caused `all_assets_map` to be recomputed on every change.
+        let this = self.await?;
+        Ok(match &this.path_ty {
+            PathType::FromIdent {
+                chunking_context,
+                ident_for_path,
+                extension,
+            } => chunking_context
+                .chunk_path(
+                    Some(Vc::upcast(self)),
+                    **ident_for_path,
+                    None,
+                    extension.clone(),
+                )
+                .await?
+                .append(".map")?
+                .cell(),
+            PathType::Fixed { path } => path.append(".map")?.cell(),
+        })
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl Asset for SourceMapAsset {
+    #[turbo_tasks::function]
+    async fn content(&self) -> Result<Vc<AssetContent>> {
+        let ty = self
+            .source_map_ty
+            .context("Cannot emit a source map asset when source maps are disabled")?;
+        let content = self.generate_source_map.generate_source_map(ty);
+        if content.await?.is_content() {
+            Ok(AssetContent::file(content))
+        } else {
+            Ok(AssetContent::file(
+                FileContent::Content(File::from(SourceMap::empty_rope())).cell(),
+            ))
+        }
+    }
+}
+
+#[turbo_tasks::value_impl]
+impl Introspectable for SourceMapAsset {
+    #[turbo_tasks::function]
+    fn ty(&self) -> Vc<RcStr> {
+        Vc::cell(rcstr!("source map"))
+    }
+
+    #[turbo_tasks::function]
+    fn title(self: Vc<Self>) -> Vc<RcStr> {
+        self.path().to_string()
+    }
+
+    #[turbo_tasks::function]
+    fn details(&self) -> Vc<RcStr> {
+        Vc::cell(rcstr!("source map of an asset"))
+    }
+
+    #[turbo_tasks::function]
+    fn children(&self) -> Result<Vc<IntrospectableChildren>> {
+        let mut children = FxIndexSet::default();
+        if let Some(asset) =
+            ResolvedVc::try_sidecast::<Box<dyn Introspectable>>(self.generate_source_map)
+        {
+            children.insert((rcstr!("asset"), asset));
+        }
+        Ok(Vc::cell(children))
+    }
+}

@@ -1,6 +1,6 @@
-import { NextIntlProvider } from 'next-intl'
+import { NextIntlProvider } from "next-intl";
 
-export default function App({ Component, messages, pageProps }) {
+export default function App({ Component, pageProps }) {
   return (
     <NextIntlProvider
       // To achieve consistent date, time and number formatting
@@ -8,9 +8,9 @@ export default function App({ Component, messages, pageProps }) {
       formats={{
         dateTime: {
           short: {
-            day: 'numeric',
-            month: 'short',
-            year: 'numeric',
+            day: "numeric",
+            month: "short",
+            year: "numeric",
           },
         },
       }}
@@ -25,5 +25,5 @@ export default function App({ Component, messages, pageProps }) {
     >
       <Component {...pageProps} />
     </NextIntlProvider>
-  )
+  );
 }

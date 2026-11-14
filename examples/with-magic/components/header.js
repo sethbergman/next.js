@@ -1,24 +1,20 @@
-import Link from 'next/link'
-import { useUser } from '../lib/hooks'
+import Link from "next/link";
+import { useUser } from "../lib/hooks";
 
 const Header = () => {
-  const user = useUser()
+  const user = useUser();
 
   return (
     <header>
       <nav>
         <ul>
           <li>
-            <Link href="/">
-              <a>Home</a>
-            </Link>
+            <Link href="/">Home</Link>
           </li>
           {user ? (
             <>
               <li>
-                <Link href="/profile">
-                  <a>Profile</a>
-                </Link>
+                <Link href="/profile">Profile</Link>
               </li>
               <li>
                 <a href="/api/logout">Logout</a>
@@ -26,9 +22,7 @@ const Header = () => {
             </>
           ) : (
             <li>
-              <Link href="/login">
-                <a>Login</a>
-              </Link>
+              <Link href="/login">Login</Link>
             </li>
           )}
         </ul>
@@ -61,7 +55,7 @@ const Header = () => {
         }
       `}</style>
     </header>
-  )
-}
+  );
+};
 
-export default Header
+export default Header;
